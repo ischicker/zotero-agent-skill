@@ -53,6 +53,8 @@ You already have a PDF (or docx, ...) on disk and want it in Zotero: `attach LIB
 
 If something fails or looks odd (ID mapping, 429s, dedupe, subcollection lookups, dialogs): `references/gotchas.md`.
 
+Screening literature for one paper (block subcollections, `prio:`/`status:`/`decision:` tags, changing decisions, CSV/BibTeX export): follow `references/screening.md`.
+
 ## Pre-approved commands (`allowed-tools`)
 
 ### Read-only
@@ -90,6 +92,7 @@ Use the hatch only for references with no identifier, and list every such entry 
 The library is a human's working space; write what a human would write by hand.
 
 - Subcollections say what a reference is about; tags say everything else. A topic or section is a subcollection, never also a tag: no tag repeats a subcollection name. Status (`needs review`), source labels and caveats are tags. Notes hold prose only, never classification.
+- `organize` adds the spec's tags and keeps every other tag an item has; only the single-value prefixes `prio:`, `status:` and `decision:` are replaced (see `references/screening.md`).
 - Tags are regular (manual, blue) tags by default. The connector forces *automatic* tags (red; hidden when "Show Automatic" is off; wiped by "Delete Automatic Tags in This Library", which is library-wide; docs: <https://www.zotero.org/support/collections_and_tags>), so `import` follows up with `organize`, one batched local-API write that sets them as regular tags (dialog counts: the table under Write commands). Say so before running. Set `"tag_type": "automatic"` in the spec only for disposable machine tags. `organize SPEC` also repairs items imported earlier.
 - Suggested vocabulary: a batch/project tag (named by the user); `needs review` on anything holding LLM text (the human removes it when checked); the source's own labels verbatim (except topic/section headings, which are subcollections); `unverified metadata` (enforced by the script). `plan` prints which tags are new vs already in the library: reuse existing names.
 - File each reference into the fitting topical subcollection. List the existing subcollections under the spec's `collection` (`colls LIB`) and give each entry `"subcollection": "<name>"` (string, or list when a paper belongs to several), using the existing name exactly. If none fits, ask the user before creating a new one; do not invent a name and do not fall back to a tag. `organize` creates any name that does not exist yet, so an invented name becomes a new subcollection. Don't number them; Zotero sorts alphabetically. `organize` places them under the spec's `collection` and moves items out of the parent; memberships outside that tree are preserved. Tell the user the parent will look nearly empty unless View > "Show Items from Subcollections" is on. Entries without a subcollection stay in the parent.
