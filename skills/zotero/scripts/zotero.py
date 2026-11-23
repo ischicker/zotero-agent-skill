@@ -239,6 +239,23 @@ def cmd_selftest(a):
         bad += not cond
         print("%-30s %s" % (label, "ok" if cond else "FAIL"))
     ref = payload_hash(import_payload(*fake(), base_opts))
+    # the allowlist file is part of the hash: a plan approved under one allowlist does not run under another
+    with tempfile.TemporaryDirectory() as td:
+        p_a = os.path.join(td, "config.json")
+        with open(p_a, "w", encoding="utf-8") as f:
+            f.write(CONFIG_EXAMPLE)
+        fp1 = allowlist_fingerprint(p_a)
+        with open(p_a, "w", encoding="utf-8") as f:
+            f.write(CONFIG_EXAMPLE.replace("Skill-Test", "JoS SDG7 Perspective"))
+        fp2 = allowlist_fingerprint(p_a)
+        fp0 = allowlist_fingerprint(os.path.join(td, "missing.json"))
+    expect("allowlist hash: file read", fp1["sha256"] and len(fp1["sha256"]) == 64)
+    expect("allowlist hash: missing file", fp0["sha256"] is None)
+    expect("allowlist hash: edit -> differs", fp1["sha256"] != fp2["sha256"])
+    expect("plan hash: other allowlist", payload_hash(import_payload(*fake(), base_opts, fp1))
+           != payload_hash(import_payload(*fake(), base_opts, fp2)))
+    expect("organize hash: other allowlist", payload_hash(organize_payload(fake()[0], {"parent": "P", "create": [], "objs": []}, fp1))
+           != payload_hash(organize_payload(fake()[0], {"parent": "P", "create": [], "objs": []}, fp2)))
     expect("hash: key order irrelevant", payload_hash({"a": 1, "b": [1, 2]}) == payload_hash({"b": [1, 2], "a": 1}))
     expect("hash: list order counts", payload_hash([1, 2]) != payload_hash([2, 1]))
     for label, payload in [("hash: one tag changed", import_payload(*fake(tag="y"), base_opts)),
@@ -1369,8 +1386,9 @@ def cmd_note(a):
     if not objs:
         print("nothing to add")
         return
-    h = payload_hash({"library": a.lib, "objects": objs})
+    h = payload_hash({"library": a.lib, "objects": objs, "allowlist": allowlist_fingerprint()})
     if a.dry_run:
+        print_target(a.lib, "(parents' collections; each must be allowlisted)")
         print("note hash (note LIB FILE --confirm): %s" % h)
         return
     confirm_or_exit("note", a.confirm, h, "note LIB FILE --dry-run")
@@ -1733,9 +1751,28 @@ def payload_hash(obj):
     return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
-def organize_payload(spec, p):
+def allowlist_fingerprint(path=None):
+    """{path, sha256} of the allowlist file as it is now (sha256 None if it cannot be read). Part of every plan hash,
+    so a plan approved under one allowlist cannot be executed under another."""
+    path = path or config_path()
+    try:
+        with open(path, "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        digest = None
+    return {"path": path, "sha256": digest}
+
+
+def print_target(library, collection, fp=None):
+    """The header every dry run prints: where the write would go and which allowlist file decides it."""
+    fp = fp or allowlist_fingerprint()
+    print("library:    %s\ncollection: %s\nallowlist:  %s\n            sha256 %s" % (
+        library, collection or "(library root)", fp["path"], fp["sha256"] or "MISSING (every write will be refused)"))
+
+
+def organize_payload(spec, p, fp=None):
     return {"library": spec["library"], "collection": spec.get("collection"), "parent_key": p["parent"],
-            "create_subcollections": p["create"], "objects": p["objs"]}
+            "create_subcollections": p["create"], "objects": p["objs"], "allowlist": fp or allowlist_fingerprint()}
 
 
 def confirm_or_exit(cmd, given, expected, how):
@@ -1767,6 +1804,7 @@ def organize(spec, entries, note_htmls, dry=False, confirm=None, bound_by_import
         for name, c in sorted(Counter(n for _, ns in p["moves"] for n in ns).items()):
             print("  -> %-50s %d item(s)" % (name, c))
         if show_hash and (objs or p["create"]):
+            print_target(spec["library"], spec.get("collection"))
             print("organize hash (organize SPEC --confirm): %s" % h)
         return h
     if not objs and not p["create"]:
@@ -1836,19 +1874,22 @@ def pdf_plan(items, entries, opts):
     return out
 
 
-def import_payload(spec, b, opts):
+def import_payload(spec, b, opts, fp=None):
     """Exactly what import would send, as one object: target, items (with child notes and tags), standalone
-    notes, the follow-up placement, and the PDF decisions. plan prints its hash; import recomputes and compares."""
+    notes, the follow-up placement, the PDF decisions, and the allowlist file it is checked against. plan prints
+    its hash; import recomputes and compares."""
     return {"target": {"library": spec["library"], "collection": spec.get("collection"), "collection_key": b["coll_key"]},
             "items": b["items"], "tag_type": b["kind"],
             "placement": {it["id"]: subcolls_of(e) for it, e in zip(b["items"], b["entries"])},
-            "pdf": {"policy": opts, "per_item": pdf_plan(b["items"], b["entries"], opts)}}
+            "pdf": {"policy": opts, "per_item": pdf_plan(b["items"], b["entries"], opts)},
+            "allowlist": fp or allowlist_fingerprint()}
 
 
 def cmd_plan(a):
     spec = load_resolved(a.spec)
     opts = import_opts(a)
     b = build_import(spec, opts["allow_unverified"])
+    print_target(spec["library"], spec.get("collection"))
     describe(spec, b, opts)
     print("-- placement/tags of items already in the collection tree:")
     organize(spec, importable_entries(spec), spec.get("standalone_notes", []), dry=True, show_hash=False)
