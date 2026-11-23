@@ -1734,6 +1734,7 @@ def cmd_verify(a):
     res = {"library": spec["library"], "collection": spec.get("collection"), "tags": spec.get("tags", []),
            "tag_type": spec.get("tag_type", "manual"),
            "standalone_notes": spec.get("standalone_notes", []), "entries": []}
+    last_arxiv = 0.0
     for e in spec["entries"]:
         r = dict(e)
         ident = e.get("id") or "(manual) " + (e.get("manual") or {}).get("title", "?")[:24]
@@ -1750,12 +1751,19 @@ def cmd_verify(a):
         elif not e.get("id"):
             r.update(status="refused", detail="entry has neither id nor manual metadata")
         else:
+            is_arxiv = ident.lower().startswith("arxiv:")
+            if is_arxiv:  # arXiv asks for ~3 s between calls; bursts get HTTP 429
+                time.sleep(max(0.0, 3.0 - (time.time() - last_arxiv)))
             try:
-                item, err = arxiv(ident.split(":", 1)[1]) if ident.lower().startswith("arxiv:") else crossref(ident)
-            except urllib.error.URLError as ex:
-                item, err = None, str(ex)
+                item, err = arxiv(ident.split(":", 1)[1]) if is_arxiv else crossref(ident)
+            except OSError as ex:  # URLError, and socket timeouts (TimeoutError), which used to crash verify
+                item, err = None, "network: %s" % ex
+            if is_arxiv:
+                last_arxiv = time.time()
             if item is None:
-                r.update(status="notfound", detail=err)
+                # a transient failure is not evidence that the identifier is wrong: status `error`, re-run verify
+                transient = err.startswith("network:") or bool(re.search(r"HTTP (429|5\d\d)\b", err or ""))
+                r.update(status="error" if transient else "notfound", detail=err)
         if not r.get("status"):
             ok, s, notes = title_matches(e.get("claimed"), item)
             r.update(item=item, title_sim=s, detail="; ".join(notes))
@@ -1765,13 +1773,16 @@ def cmd_verify(a):
                 # used by import only with --pdf --allow-spec-pdf (pdf_plan)
                 r["pdf_urls"] = pdf_candidates(ident, item.get("DOI"))
         res["entries"].append(r)
-        flag = {"ok": "  ok  ", "accepted": "accept", "mismatch": "MISMATCH", "notfound": "NOTFOUND",
+        flag = {"ok": "  ok  ", "accepted": "accept", "mismatch": "MISMATCH", "notfound": "NOTFOUND", "error": "ERROR",
                 "unverified": "UNVERIF", "refused": "REFUSED"}[r["status"]]
         print("%-8s %-34s sim=%-4s pdf=%-3s %s | %s" % (flag, ident, r.get("title_sim"), len(r.get("pdf_urls", [])),
               (r.get("item") or {}).get("title", "")[:48], r.get("detail", "")))
     write_json(out_path, res)
-    n = {k: sum(1 for x in res["entries"] if x["status"] == k) for k in ("ok", "accepted", "unverified", "mismatch", "notfound", "refused")}
+    n = {k: sum(1 for x in res["entries"] if x["status"] == k) for k in ("ok", "accepted", "unverified", "mismatch", "notfound", "error", "refused")}
     print("\n%s\nwrote %s" % (n, out_path))
+    if n["error"]:
+        print("%d entries could not be checked (network error, rate limit or server error): run verify again; "
+              "plan/import skip them until then" % n["error"])
 
 
 # ---------------------------------------------------------------- resolve: find candidate IDs for claimed references
