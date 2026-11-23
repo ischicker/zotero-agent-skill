@@ -33,6 +33,9 @@ Each change is one commit on branch `hardening` in my fork (<https://github.com/
 | A | `b0f784b` | `ZOTERO_HOST` must be loopback `http://` with a port (no userinfo, no path); `localhost` becomes `127.0.0.1`. The read guard trusts everything under `HOST`, so a remote value widened it. |
 | B | `f4a2550`, BOM part of `d0188ad` | Every file is read and written as UTF-8, with a BOM tolerated on input. `json.load(open(spec))` used the Windows code page and mangled umlauts and Nordic letters on their way into Zotero. stdout uses `errors="replace"`. |
 
+| B2 | `e792675` | `organize` replaced an item's whole tag list with the spec's tags. On an existing paper dragged into the collection, that deleted tags from other projects. It now adds the spec's tags and keeps all others; only `prio:`/`status:`/`decision:` are single-valued (only relevant with the screening convention, so that part can be dropped). |
+| B3 | `e15a6d9` | Wait 10 min instead of 3 for the approval dialog, and ring the terminal bell. Live, Zotero's dialog often opened behind other windows, and a missed one leaves an import half-done. |
+
 `d0188ad` also contains an unrelated one-line output change for `plan`, so PR B needs a split cherry-pick. I kept the history as it is.
 
 **Design changes (each builds on the previous ones):**
@@ -46,6 +49,8 @@ Each change is one commit on branch `hardening` in my fork (<https://github.com/
 | G | `0ddb02c` | PDFs off by default (`--pdf`): https only, redirects re-checked, download stopped at the cap. The spec `pdf` URL needs `--allow-spec-pdf`. `attach` only reads files from directories listed in the allowlist file. |
 | H | `97b5668` | Write log: one JSON line per write request (metadata and payload SHA-256, no content), plus a `log` command. |
 | I | `1d34ae9` | `resolve`: candidate DOIs/arXiv IDs for entries with `claimed` but no `id`, from Crossref `query.bibliographic` and arXiv. It runs under verify's guard and writes a proposal file without editing a spec. |
+| K | `a8e38ec` | Read-only `export`: a collection with its subcollections as CSV, or as BibTeX through Zotero's own translator (`format=bibtex`). The `annote` fields (child notes) are dropped unless `--keep-notes`. `--out` only creates new files. |
+| L | `245eeb0` | `references/screening.md`: a convention for screening one paper's literature (blocks, `prio:`/`status:`/`decision:` tags). Optional, and maybe too specific for upstream. |
 | J | `080447e`, `dcd9fbc` plus later doc edits | Docs: SKILL.md, read-only-safety.md and gotchas.md match the code. The README gets a "Based on" section (only relevant to the fork). |
 
 ## Open points I could not settle
