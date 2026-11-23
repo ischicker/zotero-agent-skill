@@ -74,7 +74,7 @@ SIM_OK = 0.85
 GUARD = None
 LOCAL_ONLY = (HOST + "/",)
 REMOTE_READ = LOCAL_ONLY + ("https://api.crossref.org/", "https://export.arxiv.org/", "https://api.openalex.org/")
-READ_ONLY_CMDS = {"status", "libs", "colls", "ls", "find", "notes", "path", "plan", "where", "selftest", "allowlist"}  # GUARD = LOCAL_ONLY
+READ_ONLY_CMDS = {"status", "libs", "colls", "ls", "find", "notes", "path", "plan", "where", "selftest", "allowlist", "log"}  # GUARD = LOCAL_ONLY
 VERIFY_CMDS = {"verify"}                                                                  # GUARD = REMOTE_READ
 
 
@@ -297,9 +297,88 @@ def cmd_selftest(a):
             check("attach: symlink out of dir", attach_file_problem(os.path.join(ok_dir, "link.pdf"), dirs) is not None, True)
         except (OSError, NotImplementedError):
             print("%-30s skipped (cannot create symlinks here)" % "attach: symlink out of dir")
+
+    # write log: one line per request, metadata and a payload hash only
+    with tempfile.TemporaryDirectory() as td:
+        lp_ = os.path.join(td, "writes.jsonl")
+        payload = json.dumps({"sessionID": "S", "items": [{"title": "A Confidential Title", "notes": [{"note": "private note"}]}]}).encode()
+        log_write(h + "/connector/saveItems", payload, "POST", 201, path=lp_)
+        log_write(h + "/api/local/uploads/SECRETUPLOADKEY", b"%PDF-1.7", "POST", 204, path=lp_)
+        with open(lp_, encoding="utf-8") as f:
+            text = f.read()
+        recs = [json.loads(line) for line in text.splitlines()]
+    expect("log: one line per request", len(recs) == 2)
+    expect("log: no item content", "Confidential" not in text and "private note" not in text)
+    expect("log: payload sha256", recs[0]["sha256"] == hashlib.sha256(payload).hexdigest())
+    expect("log: object count", recs[0]["objects"] == 1 and recs[1]["objects"] == 1)
+    expect("log: upload key masked", "SECRETUPLOADKEY" not in text)
+    expect("log: fields", set(recs[0]) == {"ts", "command", "library", "collection", "method", "endpoint", "objects", "sha256", "status"})
+    expect("log: count list payload", count_objects("/api/users/0/items", b'[{"key": "A"}, {"key": "B"}]') == 2)
     print("read-only commands:", ", ".join(sorted(READ_ONLY_CMDS)))
     print("network-read commands:", ", ".join(sorted(VERIFY_CMDS)))
     sys.exit(1 if bad else 0)
+
+
+# ---------------------------------------------------------------- write log (metadata only, never item content)
+LOG_CONTEXT = {"command": None, "library": None, "collection": None}  # filled by main() and the write paths
+
+
+def log_path():
+    return os.path.join(user_dir("state"), "writes.jsonl")
+
+
+def ensure_log(path=None):
+    """Make sure the write log can be appended to; called before a write is sent, so no write goes unlogged."""
+    path = path or log_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "a").close()
+    except OSError as ex:
+        sys.exit("write refused: cannot append to the write log %s (%s)" % (path, ex))
+
+
+def count_objects(endpoint, data):
+    """How many objects a write request carries: list length, connector items, 1 for a file, 0 otherwise."""
+    if endpoint.endswith(("/saveAttachment", "/file")) or "/api/local/uploads/" in endpoint:
+        return 1
+    try:
+        body = json.loads(data or b"null")
+    except (ValueError, UnicodeDecodeError):
+        return 0
+    if isinstance(body, list):
+        return len(body)
+    return len(body.get("items") or []) if isinstance(body, dict) else 0
+
+
+def log_write(url, data, method, status, path=None):
+    """Append one JSON line for one write request: when, which command, where, how many objects, the SHA-256 of
+    the payload and the HTTP status (or the exception name). Titles, notes and file contents are never written."""
+    endpoint = re.sub(r"(/api/local/uploads/)[^/?]+", r"\1*", urllib.parse.urlsplit(url).path)
+    rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "command": LOG_CONTEXT["command"],
+           "library": LOG_CONTEXT["library"], "collection": LOG_CONTEXT["collection"],
+           "method": method, "endpoint": endpoint, "objects": count_objects(endpoint, data),
+           "sha256": hashlib.sha256(data or b"").hexdigest(), "status": status}
+    with open(path or log_path(), "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, sort_keys=True) + "\n")
+
+
+def cmd_log(a):
+    """Read-only: the last N entries of the write log."""
+    p = log_path()
+    print("write log:", p)
+    if not os.path.isfile(p):
+        print("(no writes logged yet)")
+        return
+    with open(p, encoding="utf-8") as f:
+        lines = f.readlines()[-a.n:] if a.n > 0 else []
+    for line in lines:
+        try:
+            r = json.loads(line)
+            print("%s  %-9s %-6s %-40s %3s obj  %-5s  %s / %s  sha256 %s" % (
+                r.get("ts"), r.get("command"), r.get("method"), r.get("endpoint"), r.get("objects"), r.get("status"),
+                r.get("library") or "-", r.get("collection") or "-", (r.get("sha256") or "")[:16]))
+        except ValueError:
+            print("(unreadable line) " + line.strip()[:80])
 
 
 def http(url, data=None, headers=None, method=None, timeout=60, raw=False):
@@ -310,6 +389,10 @@ def http(url, data=None, headers=None, method=None, timeout=60, raw=False):
     err = write_violation(url, data, method, headers)
     if err:
         sys.exit("write refused: " + err)
+    verb = method or ("POST" if data is not None else "GET")
+    logged = verb != "GET" and urllib.parse.urlsplit(url).path not in ["/connector/" + e for e in CONNECTOR_READS]
+    if logged:
+        ensure_log()
     h = dict(UA)
     h.update(headers or {})
     req = urllib.request.Request(url, data=data, headers=h, method=method)
@@ -317,11 +400,19 @@ def http(url, data=None, headers=None, method=None, timeout=60, raw=False):
         try:
             with (urllib.request.build_opener(_GuardedRedirect).open if GUARD else urllib.request.urlopen)(req, timeout=timeout) as r:
                 body = r.read()
+                if logged:
+                    log_write(url, data, verb, r.status)
                 return (body, r.headers) if raw else body
         except urllib.error.HTTPError as e:
+            if logged:
+                log_write(url, data, verb, e.code)
             if e.code == 429 and attempt < 3:
                 time.sleep(4 * (attempt + 1))
                 continue
+            raise
+        except Exception as ex:
+            if logged:
+                log_write(url, data, verb, type(ex).__name__)
             raise
 
 
@@ -890,6 +981,7 @@ def connector_scope(library, collection):
         sys.exit("write refused: %s / %s is not in the allowlist %s" % (library, collection, config_path()))
     target, tname = connector_target(library, collection)
     CONNECTOR_SCOPE.update(session="zskill-%d" % int(time.time()), target=target)
+    LOG_CONTEXT.update(library=library, collection=collection)
     return target, tname, CONNECTOR_SCOPE["session"]
 
 
@@ -944,6 +1036,7 @@ def local_write(lib, items, kind="items"):
     if errs:
         sys.exit("write refused by the allowlist %s:\n  %s" % (config_path(), "\n  ".join(errs)))
     AUTHORIZED_LIBS.add(lp)
+    LOG_CONTEXT["library"] = lib
     h = local_authorize()
     h["Content-Type"] = "application/json"
     out = http(HOST + "/api" + lp + "/" + kind, data=json.dumps(items).encode(), method="POST", headers=h)
@@ -1050,6 +1143,7 @@ def cmd_attach(a):
         sys.exit("usage: attach LIB FILE --item KEY  |  attach LIB FILE --new DOI_OR_ARXIV_ID [--coll COLL]")
     if a.coll and not a.new:
         sys.exit("--coll only applies to --new (an existing item keeps its collections)")
+    LOG_CONTEXT["collection"] = a.coll
     why = attach_file_problem(a.file, need_config()["attach_dirs"])
     if why:
         sys.exit("attach refused: " + why)
@@ -1481,6 +1575,7 @@ def organize(spec, entries, note_htmls, dry=False, confirm=None, bound_by_import
 
 def cmd_organize(a):
     spec = load_resolved(a.spec)
+    LOG_CONTEXT["collection"] = spec.get("collection")
     organize(spec, importable_entries(spec), spec.get("standalone_notes", []), dry=a.dry_run, confirm=a.confirm)
 
 
@@ -1593,6 +1688,8 @@ def main():
     sp.add_parser("selftest", help="verify the read-only guard (needs no Zotero)").set_defaults(f=cmd_selftest)
     sp.add_parser("libs").set_defaults(f=cmd_libs)
     sp.add_parser("allowlist", help="print the write allowlist (user-owned file) and what it permits").set_defaults(f=cmd_allowlist)
+    s = sp.add_parser("log", help="print the last N entries of the write log (metadata only)")
+    s.add_argument("-n", type=int, default=20); s.set_defaults(f=cmd_log)
     s = sp.add_parser("where", help="print the directory for verify output (and its files), or the output path for SPEC")
     s.add_argument("spec", nargs="?"); s.set_defaults(f=cmd_where)
     s = sp.add_parser("colls"); s.add_argument("lib"); s.set_defaults(f=cmd_colls)
@@ -1630,9 +1727,10 @@ def main():
     s.add_argument("--max-mb", type=int, default=50); s.set_defaults(f=cmd_attach)
     s = sp.add_parser("trash", help="move items to Zotero's trash (one approval dialog)"); s.add_argument("lib"); s.add_argument("keys", nargs="+"); s.set_defaults(f=cmd_trash)
     a = p.parse_args()
+    LOG_CONTEXT["command"] = a.cmd
     global GUARD
     GUARD = LOCAL_ONLY if a.cmd in READ_ONLY_CMDS else REMOTE_READ if a.cmd in VERIFY_CMDS else None
-    if a.cmd in ("selftest", "where", "allowlist"):  # need no Zotero (allowlist uses it if it is running)
+    if a.cmd in ("selftest", "where", "allowlist", "log"):  # need no Zotero (allowlist uses it if it is running)
         return a.f(a)
     require_zotero10()
     a.f(a)
