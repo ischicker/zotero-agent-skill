@@ -425,6 +425,7 @@ def cmd_selftest(a):
     expect("export: other fields kept", "title = {T {Europe}}" in stripped and "doi = {10.1/x}" in stripped and "@book{b_y_2020" in stripped)
     check("export: GET bibtex local", read_only_violation(h + "/api/users/0/items?format=bibtex&itemKey=A,B", None, None) is not None, False)
     expect("export: is read-only", "export" in READ_ONLY_CMDS)
+    expect("approval: waits 10 min", APPROVAL_WAIT == 600)
 
     # organize keeps tags it does not manage; single-value screening prefixes are replaced, not duplicated
     cur = [{"tag": "D1.3-Ch8", "type": 0}, {"tag": "Physics - Atmospheric and Oceanic Physics", "type": 1},
@@ -1372,12 +1373,17 @@ def cmd_allowlist(a):
               "no such library" if not lp else keys[0] if len(keys) == 1 else "%d matches: ignored" % len(keys)))
 
 
+APPROVAL_WAIT = 600  # seconds to wait for a click in Zotero's approval dialog (was 180; three were missed live)
+
+
 def local_authorize():
     """Ask the user to approve ONE write request. Returns the headers for it (the key is single-use)."""
     _, hdr = http(HOST + "/api/", headers={"Zotero-API-Version": "3"}, raw=True)
     sid = hdr["Zotero-Server-ID"]
-    print("Zotero will show an approval dialog - click Allow in the Zotero window (waiting up to 3 min)...", file=sys.stderr)
-    body = http(HOST + "/api/local/authorize", data=json.dumps({"appName": "zotero skill"}).encode(), method="POST", timeout=180,
+    # \a rings the terminal bell: the dialog often opens behind other windows, and a missed one costs a re-run
+    print("\aZotero will show an approval dialog - click Allow (not Always Allow) in the Zotero window "
+          "(waiting up to %d min)..." % (APPROVAL_WAIT // 60), file=sys.stderr, flush=True)
+    body = http(HOST + "/api/local/authorize", data=json.dumps({"appName": "zotero skill"}).encode(), method="POST", timeout=APPROVAL_WAIT,
                 headers={"Zotero-API-Version": "3", "Zotero-Server-ID": sid, "Content-Type": "application/json"})
     grant = json.loads(body)
     if grant.get("remember"):
@@ -2141,7 +2147,7 @@ def organize(spec, entries, note_htmls, dry=False, confirm=None, bound_by_import
         try:
             r = local_write(spec["library"], [{"name": n, "parentCollection": p["parent"]} for n in p["create"]], kind="collections")
         except TimeoutError:
-            sys.exit("subcollections NOT created (no approval within 3 min); run `organize` again")
+            sys.exit("subcollections NOT created (no approval within %d min); run `organize --dry-run` again" % (APPROVAL_WAIT // 60))
         made = r.get("success") or {k: v["key"] for k, v in r.get("successful", {}).items()}
         if len(made) != len(p["create"]):
             sys.exit("could not create all subcollections: %s" % json.dumps(r.get("failed")))
@@ -2156,8 +2162,9 @@ def organize(spec, entries, note_htmls, dry=False, confirm=None, bound_by_import
             print("  batch %d: updated %d, failed %d" % (i // 50 + 1, len(r.get("successful", {})), len(r.get("failed", {}))))
             for k, v in (r.get("failed") or {}).items():
                 print("    failed:", v)
-        except (urllib.error.HTTPError, TimeoutError) as ex:  # no click within local_write's 3 min is a TimeoutError
-            why = "no approval within 3 min" if isinstance(ex, TimeoutError) else "HTTP %d: approval denied or expired" % ex.code
+        except (urllib.error.HTTPError, TimeoutError) as ex:  # no click within APPROVAL_WAIT is a TimeoutError
+            why = ("no approval within %d min" % (APPROVAL_WAIT // 60)) if isinstance(ex, TimeoutError) \
+                else "HTTP %d: approval denied or expired" % ex.code
             print("  batch %d NOT applied (%s); run `organize` again later" % (i // 50 + 1, why))
             break
 
