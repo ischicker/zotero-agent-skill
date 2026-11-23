@@ -48,7 +48,7 @@ The spec's top-level `tags` (e.g. `["JoS SDG7", "needs review"]`) go on every en
 2. `verify spec.json`, report every mismatch and every entry without claimed authors (title-only check). Never set `accept_mismatch` without the user.
 3. `plan spec.json`, show it, the user approves `import ... --confirm HASH` (with the paper collection selected in Zotero).
 4. Changing a screening decision: edit the entry's tags in the spec (e.g. `decision:offen` to `decision:einschliessen`, `status:abstract` to `status:gelesen`), `verify`, then `organize spec.json --dry-run` and `organize ... --confirm HASH`. Editing tags by hand in Zotero works too, but the spec then no longer describes the library and the next `organize` will set the spec's values again.
-5. A paper already in the library elsewhere is skipped by `import`. The user drags it into the paper collection in Zotero; then `organize` adds the spec's tags (keeping its others) and moves it into its block, and `note` adds the relevance note.
+5. A paper already in the library elsewhere is skipped by `import`. `file LIB KEY --coll "<Paper collection>" --dry-run`, then `--confirm HASH`, adds it to the paper collection (or the user drags it there in Zotero); then `organize` adds the spec's tags (keeping its others) and moves it into its block, and `note` adds the relevance note. Duplicates in the library have to be merged in Zotero first; the local API has no merge.
 
 ## Exports
 

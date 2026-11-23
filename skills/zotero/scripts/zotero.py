@@ -178,7 +178,7 @@ def cmd_selftest(a):
     # objects against an allowlisted tree {SKT, SUB}; state: item -> (own collections, effective collections)
     allowed = {"SKT", "SUB"}
     state = {"IN": ({"SKT"}, {"SKT"}), "OUT": ({"OTHER"}, {"OTHER"}), "BOTH": ({"SKT", "OTHER"}, {"SKT", "OTHER"}),
-             "NOTE": (set(), {"SKT"})}
+             "NOTE": (set(), {"SKT"}), "LOOSE": (set(), set())}
     for label, kind, objs, parents_ok, must_block in [
             ("scope: tags on item in tree", "items", [{"key": "IN", "version": 1, "tags": []}], allowed, False),
             ("scope: edit child note in tree", "items", [{"key": "NOTE", "version": 1, "note": "x"}], allowed, False),
@@ -200,7 +200,15 @@ def cmd_selftest(a):
             ("scope: new subcollection", "collections", [{"name": "Block 1", "parentCollection": "SKT"}], allowed, False),
             ("scope: subcoll, not permitted", "collections", [{"name": "Block 1", "parentCollection": "SKT"}], set(), True),
             ("scope: subcoll outside", "collections", [{"name": "X", "parentCollection": "OTHER"}], allowed, True),
-            ("scope: rename collection", "collections", [{"key": "SKT", "version": 1, "name": "X"}], allowed, True)]:
+            ("scope: rename collection", "collections", [{"key": "SKT", "version": 1, "name": "X"}], allowed, True),
+            ("scope: file outside item in", "items", [{"key": "OUT", "version": 1, "collections": ["OTHER", "SKT"]}], allowed, False),
+            ("scope: file unfiled item in", "items", [{"key": "LOOSE", "version": 1, "collections": ["SUB"]}], allowed, False),
+            ("scope: file + tag change", "items", [{"key": "OUT", "version": 1, "collections": ["OTHER", "SKT"], "tags": []}], allowed, True),
+            ("scope: file, drops outside", "items", [{"key": "OUT", "version": 1, "collections": ["SKT"]}], allowed, True),
+            ("scope: file into other coll", "items", [{"key": "OUT", "version": 1, "collections": ["OTHER", "ELSE"]}], allowed, True),
+            ("scope: file, no change", "items", [{"key": "OUT", "version": 1, "collections": ["OTHER"]}], allowed, True),
+            ("scope: file unknown key", "items", [{"key": "NOPE", "version": 1, "collections": ["SKT"]}], allowed, True),
+            ("scope: trash after filing rule", "items", [{"key": "OUT", "version": 1, "deleted": 1}], allowed, True)]:
         check(label, bool(scope_violations(kind, objs, allowed, parents_ok, state)), must_block)
     # backstop in http(): a non-GET request must be covered by an allowlist check made earlier in the run
     saved_libs, saved_scope = set(AUTHORIZED_LIBS), dict(CONNECTOR_SCOPE)
@@ -1256,6 +1264,15 @@ def item_state(lp, keys):
     return out
 
 
+def filing_only(o, own, allowed):
+    """True if object O only adds allowlisted collections to an item that has OWN collections: no other field, no
+    membership removed. The one write allowed on an item outside the allowlist (the `file` command), because its
+    only effect is inside an allowlisted collection."""
+    new = set(o.get("collections") or [])
+    return set(o) <= {"key", "version", "collections"} and "collections" in o and new >= own and bool(new - own) \
+        and (new - own) <= allowed
+
+
 def scope_violations(kind, objs, allowed, parents_ok, state, names=None):
     """Why the local-API objects would reach outside the allowlist (empty list: they do not).
     Existing items must be in an allowed collection (children: via their parent); collection memberships may only
@@ -1276,6 +1293,8 @@ def scope_violations(kind, objs, allowed, parents_ok, state, names=None):
             continue
         if o.get("key"):
             own, eff = state.get(o["key"], (set(), set()))
+            if not eff & allowed and o["key"] in state and filing_only(o, own, allowed):
+                continue  # `file`: only adds allowlisted collections to an existing top-level item; nothing else changes
             if not eff & allowed:
                 errs.append(what + ": the item is not in an allowlisted collection")
             elif o.get("deleted") and eff - allowed:
@@ -1526,6 +1545,51 @@ def cmd_attach(a):
     else:
         t = attach_new(a.lib, a.coll, a.new, path, body, ctype, title)
         print("created %s and attached %s (%.0f KB) -> %s" % (a.new, os.path.basename(path), len(body) / 1024, t))
+
+
+def cmd_file(a):
+    """Add existing top-level items (e.g. a paper already filed under another project) to an allowlisted collection.
+    Only the collection membership is added; tags, fields and other memberships stay as they are. One request, one
+    approval dialog, bound to the hash printed by --dry-run."""
+    lp, allowed, _ = allowed_keys(a.lib)
+    target = collection_key(lp, a.coll)
+    if target not in allowed:
+        sys.exit("file refused: %s / %s is not in the allowlist %s" % (a.lib, a.coll, config_path()))
+    names = {c["key"]: c["data"]["name"] for c in all_collections(lp)}
+    objs, already = [], []
+    for k in a.keys:
+        try:
+            it = zget(lp + "/items/" + k, include="data")[0]
+        except urllib.error.HTTPError as ex:
+            sys.exit("No item %s in %s (HTTP %d)" % (k, a.lib, ex.code))
+        d = it["data"]
+        if d.get("itemType") in ("note", "attachment") or d.get("parentItem"):
+            sys.exit("%s is a child %s; file the parent item" % (k, d.get("itemType")))
+        if d.get("deleted"):
+            sys.exit("%s is in the trash" % k)
+        cur = list(d.get("collections", []))
+        print("  %s  %s\n      now in: %s" % (k, (d.get("title") or "")[:70], ", ".join(names.get(c, c) for c in cur) or "(no collection)"))
+        if target in cur:
+            already.append(k)
+            continue
+        objs.append({"key": k, "version": it["version"], "collections": cur + [target]})
+    for k in already:
+        print("  skip %s: already in %s" % (k, a.coll))
+    if not objs:
+        print("nothing to file")
+        return
+    h = payload_hash({"library": a.lib, "collection_key": target, "objects": objs, "allowlist": allowlist_fingerprint()})
+    if a.dry_run:
+        print_target(a.lib, a.coll)
+        print("will add %d item(s) to %r; nothing else changes" % (len(objs), a.coll))
+        print("file hash (file LIB KEY... --coll COLL --confirm): %s" % h)
+        return
+    confirm_or_exit("file", a.confirm, h, "file LIB KEY... --coll COLL --dry-run")
+    LOG_CONTEXT["collection"] = a.coll
+    r = local_write(a.lib, objs)
+    print("filed %d, failed %d" % (len(r.get("successful") or {}), len(r.get("failed") or {})))
+    for k, v in (r.get("failed") or {}).items():
+        print("  failed %s: %s" % (k, v))
 
 
 NOTE_KEYS = {"parent", "note", "tags"}
@@ -2333,6 +2397,10 @@ def main():
     s.add_argument("--item", help="key of the existing parent item"); s.add_argument("--new", metavar="ID", help="DOI or arXiv:ID of a new item to create")
     s.add_argument("--coll", help="with --new: collection to put it in (default: library root)"); s.add_argument("--title", help="attachment title (default: Full Text PDF / file name)")
     s.add_argument("--max-mb", type=int, default=50); s.set_defaults(f=cmd_attach)
+    s = sp.add_parser("file", help="add existing items to an allowlisted collection (membership only; one approval dialog); --dry-run, then --confirm HASH")
+    s.add_argument("lib"); s.add_argument("keys", nargs="+", metavar="KEY"); s.add_argument("--coll", required=True)
+    s.add_argument("--dry-run", action="store_true"); s.add_argument("--confirm", metavar="HASH")
+    s.set_defaults(f=cmd_file)
     s = sp.add_parser("note", help="add child notes to existing items from a JSON list of {parent, note, tags} (one approval dialog); --dry-run, then --confirm HASH")
     s.add_argument("lib"); s.add_argument("file")
     s.add_argument("--dry-run", action="store_true", help="show the notes and their hash, write nothing")
