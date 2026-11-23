@@ -855,7 +855,7 @@ def load_config(path=None):
     path = path or config_path()
     try:
         st = os.stat(path)
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:  # -sig: Notepad and PowerShell may write a BOM
             text = f.read()
     except FileNotFoundError:
         return None, "no allowlist file at %s" % path
@@ -1228,7 +1228,7 @@ def note_objects(lib, entries):
 def cmd_note(a):
     """Add child notes to items already in the library: one local-API request, one approval dialog, bound to
     the hash printed by --dry-run and to the allowlist (every parent must be in an allowlisted collection)."""
-    with open(a.file, encoding="utf-8") as f:
+    with open(a.file, encoding="utf-8-sig") as f:
         try:
             entries = json.load(f)
         except ValueError as ex:
@@ -1625,7 +1625,7 @@ def confirm_or_exit(cmd, given, expected, how):
              % (cmd, why, how))
 
 
-def organize(spec, entries, note_htmls, dry=False, confirm=None, bound_by_import=False):
+def organize(spec, entries, note_htmls, dry=False, confirm=None, bound_by_import=False, show_hash=True):
     """Plan, show, and (unless dry) send organize's local-API writes: one approval dialog to create subcollections,
     then one per 50 items. A standalone run must be confirmed with the hash of the plan (--confirm); after
     `import`, the import hash already covers the intent and the items did not exist when it was computed."""
@@ -1642,7 +1642,7 @@ def organize(spec, entries, note_htmls, dry=False, confirm=None, bound_by_import
         from collections import Counter
         for name, c in sorted(Counter(n for _, ns in p["moves"] for n in ns).items()):
             print("  -> %-50s %d item(s)" % (name, c))
-        if objs or p["create"]:
+        if show_hash and (objs or p["create"]):
             print("organize hash (organize SPEC --confirm): %s" % h)
         return h
     if not objs and not p["create"]:
@@ -1727,7 +1727,7 @@ def cmd_plan(a):
     b = build_import(spec, opts["allow_unverified"])
     describe(spec, b, opts)
     print("-- placement/tags of items already in the collection tree:")
-    organize(spec, importable_entries(spec), spec.get("standalone_notes", []), dry=True)
+    organize(spec, importable_entries(spec), spec.get("standalone_notes", []), dry=True, show_hash=False)
     if b["items"]:
         print("plan hash (import SPEC %s--confirm): %s" % (import_flags(opts), payload_hash(import_payload(spec, b, opts))))
     else:
