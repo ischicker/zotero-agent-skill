@@ -24,7 +24,7 @@ The repository has no LICENSE file, so by default nobody else may reuse or redis
 
 ## 3. Hardening changes, offered as PRs
 
-Each change is one commit on branch `hardening` in my fork (<FORK URL>). They keep the structure: stdlib only, one CLI file, SKILL.md as the agent's instructions. Each is covered by `selftest` without Zotero, and the write paths were also exercised end to end against a stub of the local API. Take any subset; I'd open them as separate PRs in this order.
+Each change is one commit on branch `hardening` in my fork (<https://github.com/ischicker/zotero-agent-skill/tree/hardening>). They keep the structure: stdlib only, one CLI file, SKILL.md as the agent's instructions. Each is covered by `selftest` without Zotero, and the write paths were also exercised end to end against a stub of the local API. Take any subset; I'd open them as separate PRs in this order.
 
 **Bug fixes (small, independent):**
 
