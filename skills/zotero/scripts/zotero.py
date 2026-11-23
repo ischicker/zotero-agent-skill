@@ -349,13 +349,16 @@ def cmd_selftest(a):
                    {"id": "L2", "name": "A Group", "level": 0}, {"id": "C20", "name": "Skill-Test", "level": 1}]
     ids = library_target_ids({"targets": sel_targets}, "My Library", {"skill-test", "block 2"})
     expect("preflight: ids of allowed colls", ids == {"C7", "C8"})
-    def sel(**kw):
-        return dict({"libraryID": 1, "libraryName": "My Library", "editable": True, "id": "C7", "name": "Skill-Test",
+    def sel(**kw):  # shape of a real Zotero 10.0.8 response: numeric top-level id, "C<n>" ids in targets
+        return dict({"libraryID": 1, "libraryName": "Meine Bibliothek", "editable": True, "id": 7, "name": "Skill-Test",
                      "targets": sel_targets}, **kw)
     for label, resp, must_block in [("preflight: allowed selected", sel(), False),
-                                    ("preflight: subcoll selected", sel(id="C8", name="Block 2"), False),
-                                    ("preflight: other coll selected", sel(id="C9", name="Other"), True),
-                                    ("preflight: same name, group", sel(id="C20", libraryID=2), True),
+                                    ("preflight: id as tree id", sel(id="C7"), False),
+                                    ("preflight: subcoll selected", sel(id=8, name="Block 2"), False),
+                                    ("preflight: other coll selected", sel(id=9, name="Other"), True),
+                                    ("preflight: same name, group", sel(id=20, libraryID=2), True),
+                                    ("preflight: library id L1", sel(id="L1"), True),
+                                    ("preflight: id true (bool)", sel(id=True), True),
                                     ("preflight: library root", sel(id=None, name="My Library"), True),
                                     ("preflight: not editable", sel(editable=False), True),
                                     ("preflight: no response", None, True),
@@ -660,7 +663,12 @@ def selected_target_problem(sel, allowed_ids):
         return "the row selected in the Zotero window (%r) is not editable" % sel.get("name")
     if not sel.get("id"):
         return "the library root (%r) is selected in the Zotero window, not a collection" % sel.get("libraryName")
-    if sel["id"] not in allowed_ids:
+    # the top-level id is the numeric collection.id (3); the rows in `targets` use the tree-view id ("C3")
+    sid = sel["id"]
+    sid = "C%d" % sid if isinstance(sid, int) and not isinstance(sid, bool) else str(sid)
+    if not re.fullmatch(r"C\d+", sid):
+        return "could not determine the collection selected in the Zotero window (unexpected id %r)" % (sel["id"],)
+    if sid not in allowed_ids:
         return "the collection selected in the Zotero window (%r) is not on the allowlist" % sel.get("name")
     return None
 
