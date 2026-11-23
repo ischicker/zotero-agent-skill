@@ -26,7 +26,44 @@ source document claimed before anything is written.
 import argparse, difflib, hashlib, html, json, mimetypes, os, re, stat, sys, tempfile, time, urllib.error, urllib.parse, urllib.request
 import xml.etree.ElementTree as ET
 
-HOST = os.environ.get("ZOTERO_HOST", "http://127.0.0.1:23119")
+DEFAULT_HOST = "http://127.0.0.1:23119"
+LOOPBACK_NAMES = ("127.0.0.1", "::1", "localhost")
+
+
+def host_problem(value):
+    """None if `value` is exactly http://<loopback>:<port>[/], else the reason it is refused.
+
+    Zotero's local API and connector only listen on loopback, and the read-only guard trusts every URL under HOST,
+    so a ZOTERO_HOST pointing anywhere else would turn the guard into an allowlist for that host."""
+    try:
+        u = urllib.parse.urlsplit(value)
+        port = u.port
+    except ValueError as ex:
+        return "cannot parse (%s)" % ex
+    if u.scheme != "http":
+        return "scheme must be http, not %r" % u.scheme
+    if "@" in u.netloc:
+        return "userinfo (user@host) is not allowed"
+    if (u.hostname or "") not in LOOPBACK_NAMES:
+        return "host %r is not a loopback address (%s)" % (u.hostname, ", ".join(LOOPBACK_NAMES))
+    if port is None:
+        return "an explicit port is required"
+    if u.path not in ("", "/") or u.query or u.fragment:
+        return "no path, query or fragment allowed"
+    return None
+
+
+def canonical_host(value):
+    """Validated, canonical HOST. `localhost` becomes 127.0.0.1 so a hosts-file entry cannot redirect it."""
+    err = host_problem(value)
+    if err:
+        sys.exit("refusing to start: ZOTERO_HOST=%r: %s" % (value, err))
+    u = urllib.parse.urlsplit(value)
+    name = "[::1]" if u.hostname == "::1" else "127.0.0.1"
+    return "http://%s:%d" % (name, u.port)
+
+
+HOST = canonical_host(os.environ.get("ZOTERO_HOST", DEFAULT_HOST))
 UA = {"User-Agent": "zotero-skill/0.1"}
 SIM_OK = 0.85
 
@@ -72,6 +109,8 @@ def cmd_selftest(a):
              ("DELETE", (h + "/api/groups/1/items/ABC", None, "DELETE"), True, LOCAL_ONLY),
              ("connector POST", (h + "/connector/saveItems", b"{}", "POST"), True, LOCAL_ONLY),
              ("GET off-host (Crossref)", (cr, None, None), True, LOCAL_ONLY),
+             ("GET local userinfo trick", (h + "@evil.example/api/", None, None), True, LOCAL_ONLY),
+             ("GET local lookalike port", (h + "0/api/", None, None), True, LOCAL_ONLY),
              ("verify: GET Crossref", (cr, None, None), False, REMOTE_READ),
              ("verify: GET arXiv", (ax, None, None), False, REMOTE_READ),
              ("verify: GET local ping", (h + "/connector/ping", None, None), False, REMOTE_READ),
@@ -97,6 +136,24 @@ def cmd_selftest(a):
         print("%-30s BLOCKED ok" % "verify: redirect off-host")
     finally:
         GUARD = saved
+    # ZOTERO_HOST must be loopback http (checked at startup by canonical_host)
+    hosts = [("host: default", DEFAULT_HOST, False),
+             ("host: localhost", "http://localhost:23119", False),
+             ("host: ipv6 loopback", "http://[::1]:23119", False),
+             ("host: remote", "http://example.org:23119", True),
+             ("host: remote ip", "http://192.168.1.10:23119", True),
+             ("host: lookalike", "http://127.0.0.1.evil.example:23119", True),
+             ("host: lookalike localhost", "http://localhost.evil.example:23119", True),
+             ("host: userinfo trick", "http://127.0.0.1:23119@evil.example", True),
+             ("host: userinfo on loopback", "http://evil.example@127.0.0.1:23119", True),
+             ("host: https", "https://127.0.0.1:23119", True),
+             ("host: no port", "http://127.0.0.1", True),
+             ("host: path", "http://127.0.0.1:23119/x", True),
+             ("host: short form 127.1", "http://127.1:23119", True)]
+    for label, value, must_block in hosts:
+        blocked = host_problem(value) is not None
+        bad += blocked != must_block
+        print("%-30s %s %s" % (label, "BLOCKED" if blocked else "allowed", "ok" if blocked == must_block else "FAIL"))
     print("read-only commands:", ", ".join(sorted(READ_ONLY_CMDS)))
     print("network-read commands:", ", ".join(sorted(VERIFY_CMDS)))
     sys.exit(1 if bad else 0)
