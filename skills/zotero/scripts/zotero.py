@@ -392,6 +392,18 @@ def cmd_selftest(a):
             os.chmod(p_cfg, 0o600)
         expect("utf-8: allowlist with BOM", load_config(p_cfg)[1] is None)
 
+    # organize keeps tags it does not manage; single-value screening prefixes are replaced, not duplicated
+    cur = [{"tag": "D1.3-Ch8", "type": 0}, {"tag": "Physics - Atmospheric and Oceanic Physics", "type": 1},
+           {"tag": "needs review", "type": 1}, {"tag": "decision:offen", "type": 0}, {"tag": "prio:sollte", "type": 0}]
+    got = sorted((t["tag"], t["type"]) for t in merged_tags(cur, tag_objs(["needs review", "decision:einschliessen", "prio:muss"], 0)))
+    expect("tags: foreign tags kept", ("D1.3-Ch8", 0) in got and ("Physics - Atmospheric and Oceanic Physics", 1) in got)
+    expect("tags: spec tag made regular", ("needs review", 0) in got and ("needs review", 1) not in got)
+    expect("tags: decision replaced", ("decision:einschliessen", 0) in got and ("decision:offen", 0) not in got)
+    expect("tags: prio replaced", ("prio:muss", 0) in got and ("prio:sollte", 0) not in got)
+    expect("tags: nothing else", len(got) == 5)
+    expect("tags: no prefix tag in spec", ("decision:offen", 0) in
+           [(t["tag"], t["type"]) for t in merged_tags(cur, tag_objs(["JoS SDG7"], 0))])
+
     # resolve: input parsing, parsing canned Crossref/arXiv responses, ranking; the guard covers its URLs
     pending = {"needs_id": [{"claimed": {"title": "Energy droughts from variable renewable energy sources in European climates",
                                          "authors": "Raynaud et al.", "year": 2018}, "venue": "Renewable Energy"},
@@ -1738,6 +1750,21 @@ def tag_objs(names, kind):
     return out
 
 
+SINGLE_VALUE_PREFIXES = ("prio:", "status:", "decision:")  # screening convention: one tag per prefix
+
+
+def merged_tags(current, wanted):
+    """The tag list organize writes: the spec's tags (with the spec's type, which turns the connector's automatic tags
+    into regular ones) plus every existing tag the spec does not name, unchanged. A spec tag with a single-value
+    prefix (prio:, status:, decision:) replaces existing tags with that prefix, so a changed decision does not leave
+    the old one behind. Tags the user or another project added are never dropped. Pure; selftest calls it."""
+    names = {t["tag"].lower() for t in wanted}
+    owned = {p for p in SINGLE_VALUE_PREFIXES for t in wanted if t["tag"].lower().startswith(p)}
+    keep = [{"tag": t["tag"], "type": t.get("type", 0)} for t in current
+            if t["tag"].lower() not in names and not any(t["tag"].lower().startswith(p) for p in owned)]
+    return list(wanted) + keep
+
+
 def wanted_names(spec, e):
     names = list(spec.get("tags", [])) + list(e.get("tags", []))
     if e.get("status") == "unverified":
@@ -1873,7 +1900,7 @@ def organize_plan(spec, entries, note_htmls):
         if i is None:
             missing_items.append(label); return
         d = i["data"]
-        want_tags = tag_objs(names, kind)
+        want_tags = merged_tags(d.get("tags", []), tag_objs(names, kind))
         tags_differ = sorted((t["tag"], t["type"]) for t in want_tags) != sorted((t["tag"], t.get("type", 0)) for t in d.get("tags", []))
         cur = list(d.get("collections", []))
         new = cur
