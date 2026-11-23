@@ -23,7 +23,7 @@ Design rule: the model never types bibliographic metadata. It supplies identifie
 (DOI / arXiv ID); metadata comes from Crossref / arXiv and is compared with what the
 source document claimed before anything is written.
 """
-import argparse, difflib, hashlib, html, json, mimetypes, os, re, stat, sys, tempfile, time, urllib.error, urllib.parse, urllib.request
+import argparse, difflib, hashlib, html, ipaddress, json, mimetypes, os, re, stat, sys, tempfile, time, urllib.error, urllib.parse, urllib.request
 import xml.etree.ElementTree as ET
 
 DEFAULT_HOST = "http://127.0.0.1:23119"
@@ -224,7 +224,7 @@ def cmd_selftest(a):
                 {"coll_key": "SKT", "kind": 0, "n_entries": 1,
                  "items": [{"id": "i1", "itemType": "preprint", "title": "T", "tags": [{"tag": tag, "type": 0}], "notes": []}],
                  "entries": [{"pdf_urls": [url], "subcollection": sub}]})
-    base_opts = {"allow_unverified": False, "no_pdf": False, "max_pdf_mb": 50}
+    base_opts = {"allow_unverified": False, "pdf": True, "allow_spec_pdf": False, "max_pdf_mb": 50}
     def expect(label, cond):
         nonlocal bad
         bad += not cond
@@ -235,7 +235,8 @@ def cmd_selftest(a):
     for label, payload in [("hash: one tag changed", import_payload(*fake(tag="y"), base_opts)),
                            ("hash: PDF URL changed", import_payload(*fake(url="https://arxiv.org/pdf/2"), base_opts)),
                            ("hash: subcollection changed", import_payload(*fake(sub="Block 2"), base_opts)),
-                           ("hash: --no-pdf", import_payload(*fake(), dict(base_opts, no_pdf=True))),
+                           ("hash: PDFs off", import_payload(*fake(), dict(base_opts, pdf=False))),
+                           ("hash: --allow-spec-pdf", import_payload(*fake(), dict(base_opts, allow_spec_pdf=True))),
                            ("hash: --max-pdf-mb", import_payload(*fake(), dict(base_opts, max_pdf_mb=10))),
                            ("hash: --allow-unverified", import_payload(*fake(), dict(base_opts, allow_unverified=True)))]:
         expect(label + " -> differs", payload_hash(payload) != ref)
@@ -250,6 +251,52 @@ def cmd_selftest(a):
                 print("confirm: refusal leaks the expected hash FAIL")
                 bad += 1
         check(label, blocked, must_block)
+
+    # PDFs: https to public hosts only (redirects too), real PDFs within the cap, spec URLs only when allowed
+    for label, url, must_block in [("pdf: https arXiv", "https://arxiv.org/pdf/2506.08872", False),
+                                   ("pdf: plain http", "http://arxiv.org/pdf/1", True),
+                                   ("pdf: userinfo trick", "https://arxiv.org@evil.example/x.pdf", True),
+                                   ("pdf: loopback", "https://127.0.0.1/x.pdf", True),
+                                   ("pdf: localhost", "https://localhost/x.pdf", True),
+                                   ("pdf: private address", "https://10.0.0.5/x.pdf", True),
+                                   ("pdf: link-local metadata", "https://169.254.169.254/x", True),
+                                   ("pdf: file URL", "file:///etc/passwd", True)]:
+        check(label, not pdf_url_ok(url), must_block)
+    try:
+        _HttpsOnlyRedirect().redirect_request(urllib.request.Request("https://arxiv.org/pdf/1"), None, 302, "Found", {},
+                                              "http://example.org/x.pdf")
+        check("pdf: redirect to http", False, True)
+    except urllib.error.URLError:
+        check("pdf: redirect to http", True, True)
+    check("pdf: real PDF within cap", pdf_body_problem(b"%PDF-1.7 ...", 100) is not None, False)
+    check("pdf: HTML error page", pdf_body_problem(b"<html>403</html>", 100) is not None, True)
+    check("pdf: over the cap", pdf_body_problem(b"%PDF-" + b"0" * 100, 100) is not None, True)
+    items = [{"id": "i1"}]
+    entries = [{"pdf": "https://example.org/spec.pdf",  # pdf_urls as an older verify wrote them (spec URL mixed in)
+                "pdf_urls": ["https://example.org/spec.pdf", "https://arxiv.org/pdf/1", "http://insecure.example/x.pdf"]}]
+    expect("pdf plan: off by default", pdf_plan(items, entries, dict(base_opts, pdf=False)) == {})
+    expect("pdf plan: --pdf skips spec URL", pdf_plan(items, entries, base_opts) == {"i1": ["https://arxiv.org/pdf/1"]})
+    expect("pdf plan: --allow-spec-pdf", pdf_plan(items, entries, dict(base_opts, allow_spec_pdf=True))
+           == {"i1": ["https://example.org/spec.pdf", "https://arxiv.org/pdf/1"]})
+
+    # attach: only files inside an attach_dirs entry, after resolving .. and symlinks
+    with tempfile.TemporaryDirectory() as td:
+        ok_dir, other = os.path.join(td, "pdfs"), os.path.join(td, "other")
+        os.makedirs(ok_dir); os.makedirs(other)
+        for p in (os.path.join(ok_dir, "a.pdf"), os.path.join(other, "b.pdf")):
+            open(p, "wb").close()
+        dirs = [ok_dir]
+        check("attach: file in attach dir", attach_file_problem(os.path.join(ok_dir, "a.pdf"), dirs) is not None, False)
+        check("attach: file elsewhere", attach_file_problem(os.path.join(other, "b.pdf"), dirs) is not None, True)
+        check("attach: .. out of attach dir", attach_file_problem(os.path.join(ok_dir, "..", "other", "b.pdf"), dirs) is not None, True)
+        check("attach: the dir itself", attach_file_problem(ok_dir, dirs) is not None, True)
+        check("attach: prefix lookalike dir", attach_file_problem(os.path.join(td, "pdfs-evil", "c.pdf"), dirs) is not None, True)
+        check("attach: no attach_dirs", attach_file_problem(os.path.join(ok_dir, "a.pdf"), []) is not None, True)
+        try:
+            os.symlink(os.path.join(other, "b.pdf"), os.path.join(ok_dir, "link.pdf"))
+            check("attach: symlink out of dir", attach_file_problem(os.path.join(ok_dir, "link.pdf"), dirs) is not None, True)
+        except (OSError, NotImplementedError):
+            print("%-30s skipped (cannot create symlinks here)" % "attach: symlink out of dir")
     print("read-only commands:", ", ".join(sorted(READ_ONLY_CMDS)))
     print("network-read commands:", ", ".join(sorted(VERIFY_CMDS)))
     sys.exit(1 if bad else 0)
@@ -632,8 +679,9 @@ def library_tags(lp):
 # Every write is checked twice: local_write() and connector_scope() compare the target with the allowlist, and
 # http() refuses any non-GET request that no such check covered (write_violation). No file, no writes.
 APP_DIR = "zotero-skill"
-CONFIG_KEYS = {"write_targets", "_comment"}
-CONFIG_EXAMPLE = '{"write_targets": [{"library": "My Library", "collection": "Skill-Test", "subcollections": true}]}'
+CONFIG_KEYS = {"write_targets", "attach_dirs", "_comment"}
+CONFIG_EXAMPLE = json.dumps({"write_targets": [{"library": "My Library", "collection": "Skill-Test", "subcollections": True}],
+                             "attach_dirs": [os.path.join(os.path.expanduser("~"), "Documents", "zotero-attach")]})
 AUTHORIZED_LIBS = set()   # library paths ("/users/0") whose write targets local_write() checked in this run
 CONNECTOR_SCOPE = {}      # {"session", "target"} once connector_scope() checked the target in this run
 CONNECTOR_READS = ("getSelectedCollection", "ping")  # connector POSTs that read only
@@ -673,8 +721,26 @@ def parse_config(text):
                 or not isinstance(t.get("subcollections", False), bool)):
             return None, ("each write_targets entry needs non-empty strings library and collection, and optionally "
                           "subcollections: true/false; got %s" % json.dumps(t))
-    c["write_targets"] = targets
+    dirs = c.get("attach_dirs", [])
+    if not isinstance(dirs, list) or not all(isinstance(d, str) and os.path.isabs(os.path.expanduser(d)) for d in dirs):
+        return None, "attach_dirs must be a list of absolute directory paths"
+    c["write_targets"], c["attach_dirs"] = targets, dirs
     return c, None
+
+
+def attach_file_problem(path, dirs):
+    """None if `path`, with symlinks resolved, is a file strictly inside one of `dirs` (also resolved), else why not.
+    Resolving first means neither `..` nor a symlink placed inside an allowed directory can reach outside it."""
+    real = os.path.realpath(os.path.expanduser(path))
+    for d in dirs:
+        rd = os.path.realpath(os.path.expanduser(d))
+        try:
+            inside = os.path.commonpath([os.path.normcase(real), os.path.normcase(rd)]) == os.path.normcase(rd)
+        except ValueError:  # different drives
+            inside = False
+        if inside and os.path.normcase(real) != os.path.normcase(rd):
+            return None
+    return "%s (resolved: %s) is not inside any attach_dirs entry of %s" % (path, real, config_path())
 
 
 def load_config(path=None):
@@ -839,6 +905,11 @@ def cmd_allowlist(a):
     for t in c["write_targets"]:
         print("write target: %s / %s  %s" % (t["library"], t["collection"],
               "(and its subcollections)" if t.get("subcollections") else "(this collection only)"))
+    if not c["attach_dirs"]:
+        print("attach_dirs: none, so `attach` accepts no file")
+    for d in c["attach_dirs"]:
+        rd = os.path.realpath(os.path.expanduser(d))
+        print("attach dir:   %s%s%s" % (d, "" if rd == d else "  (resolved: %s)" % rd, "" if os.path.isdir(rd) else "  [missing]"))
     try:
         require_zotero10()
     except SystemExit:
@@ -979,7 +1050,10 @@ def cmd_attach(a):
         sys.exit("usage: attach LIB FILE --item KEY  |  attach LIB FILE --new DOI_OR_ARXIV_ID [--coll COLL]")
     if a.coll and not a.new:
         sys.exit("--coll only applies to --new (an existing item keeps its collections)")
-    path, body, ctype = read_local_file(a.file, a.max_mb)
+    why = attach_file_problem(a.file, need_config()["attach_dirs"])
+    if why:
+        sys.exit("attach refused: " + why)
+    path, body, ctype = read_local_file(os.path.realpath(os.path.expanduser(a.file)), a.max_mb)
     title = a.title or ("Full Text PDF" if ctype == "application/pdf" else os.path.basename(path))
     if a.item:
         k = attach_existing(a.lib, a.item, path, body, ctype, title)
@@ -1082,7 +1156,9 @@ def cmd_verify(a):
             r.update(item=item, title_sim=s, detail="; ".join(notes))
             r["status"] = "ok" if ok else ("accepted" if e.get("accept_mismatch") else "mismatch")
             if not a.no_pdf and r["status"] in ("ok", "accepted"):
-                r["pdf_urls"] = ([e["pdf"]] if e.get("pdf") else pdf_candidates(ident, item.get("DOI")))
+                # open-access candidates only; the spec's own free-form `pdf` URL stays in the entry as given and is
+                # used by import only with --pdf --allow-spec-pdf (pdf_plan)
+                r["pdf_urls"] = pdf_candidates(ident, item.get("DOI"))
         res["entries"].append(r)
         flag = {"ok": "  ok  ", "accepted": "accept", "mismatch": "MISMATCH", "notfound": "NOTFOUND",
                 "unverified": "UNVERIF", "refused": "REFUSED"}[r["status"]]
@@ -1094,14 +1170,59 @@ def cmd_verify(a):
     print("\n%s\nwrote %s" % (n, out_path))
 
 
-def fetch_pdf(urls):
+def pdf_url_ok(url):
+    """True for an https URL to a named or public host: no userinfo, no loopback/private/link-local address."""
+    try:
+        u = urllib.parse.urlsplit(url)
+        host = (u.hostname or "").lower()
+    except ValueError:
+        return False
+    if u.scheme != "https" or not host or "@" in u.netloc or host == "localhost" or host.endswith(".localhost"):
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return True
+    return ip.is_global
+
+
+class _HttpsOnlyRedirect(urllib.request.HTTPRedirectHandler):
+    """PDF downloads: a redirect must satisfy pdf_url_ok too (no downgrade to http, no bounce to a local address)."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not pdf_url_ok(newurl):
+            raise urllib.error.URLError("redirect to %s refused (https to a public host only)" % newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def pdf_body_problem(body, cap):
+    """None if `body` (read up to cap + 1 bytes) is a PDF within the cap, else why not."""
+    if len(body) > cap:
+        return "larger than %d MB" % (cap // 1_000_000)
+    if body[:5] != b"%PDF-":
+        return "not a PDF (no %PDF- header)"
+    return None
+
+
+def fetch_pdf(urls, max_mb):
+    """(url, bytes) for the first URL that yields a PDF within the cap, else (None, None). https only, redirects
+    included; the body is never read past the cap."""
+    cap = int(max_mb * 1_000_000)
+    opener = urllib.request.build_opener(_HttpsOnlyRedirect)
     for u in urls:
-        try:
-            body = http(u, headers={"Accept": "application/pdf"}, timeout=90)
-        except Exception as ex:
+        if not pdf_url_ok(u):
+            print("  PDF URL refused (https to a public host only): %s" % u)
             continue
-        if body[:5] == b"%PDF-" and len(body) < 150_000_000:
-            return u, body
+        try:
+            with opener.open(urllib.request.Request(u, headers=dict(UA, Accept="application/pdf")), timeout=90) as r:
+                body = r.read(cap + 1)
+        except Exception as ex:
+            print("  PDF fetch failed: %s (%s)" % (u, ex))
+            continue
+        why = pdf_body_problem(body, cap)
+        if why:
+            print("  PDF skipped, %s: %s" % (why, u))
+            continue
+        return u, body
     return None, None
 
 
@@ -1172,14 +1293,23 @@ def build_import(spec, allow_unverified):
             "skipped": skipped, "kind": kind}
 
 
-def describe(spec, b):
+def describe(spec, b, opts):
     kind = "automatic" if b["kind"] == 1 else "regular"
     print("target: %s / %s%s" % (spec["library"], spec.get("collection") or "(library root)",
                                  "  [collection key %s]" % b["coll_key"] if b["coll_key"] else ""))
     items = b["items"]
-    print("new items: %d | child notes: %d | standalone notes: %d | PDF candidates: %d entries"
-          % (b["n_entries"], sum(len(i.get("notes", [])) for i in items), len(items) - b["n_entries"],
-             sum(1 for e in b["entries"] if e.get("pdf_urls"))))
+    print("new items: %d | child notes: %d | standalone notes: %d"
+          % (b["n_entries"], sum(len(i.get("notes", [])) for i in items), len(items) - b["n_entries"]))
+    if not opts["pdf"]:
+        print("PDFs: off (pass --pdf to plan and import to fetch open-access PDFs over https)")
+    else:
+        pdfs = pdf_plan(items, b["entries"], opts)
+        ignored = sum(1 for e in b["entries"] if e.get("pdf")) if not opts["allow_spec_pdf"] else 0
+        print("PDFs: %d of %d new items have https candidates (cap %d MB)%s" % (
+            len(pdfs), b["n_entries"], opts["max_pdf_mb"],
+            "; %d spec `pdf` URLs ignored (needs --allow-spec-pdf)" % ignored if ignored else ""))
+        for k, urls in sorted(pdfs.items(), key=lambda kv: int(kv[0][1:])):
+            print("  %s: %s" % (k, " | ".join(urls)))
     unv = [e for e in b["entries"] if e["status"] == "unverified"]
     for e in unv:
         print("  UNVERIFIED (user affirmed): %s | %s" % ((e["item"].get("title") or "")[:60], e["user_affirmed"][:80]))
@@ -1356,19 +1486,34 @@ def cmd_organize(a):
 
 def import_opts(a):
     """The flags plan and import share; they are part of the import hash, so both must be given the same ones."""
-    return {"allow_unverified": bool(a.allow_unverified), "no_pdf": bool(a.no_pdf), "max_pdf_mb": a.max_pdf_mb}
+    if a.allow_spec_pdf and not a.pdf:
+        sys.exit("--allow-spec-pdf only makes sense with --pdf")
+    if a.pdf and a.no_pdf:
+        sys.exit("--pdf and --no-pdf contradict each other (no PDFs is the default)")
+    return {"allow_unverified": bool(a.allow_unverified), "pdf": bool(a.pdf), "allow_spec_pdf": bool(a.allow_spec_pdf),
+            "max_pdf_mb": a.max_pdf_mb}
 
 
 def import_flags(opts):
-    return "".join(["--allow-unverified " if opts["allow_unverified"] else "", "--no-pdf " if opts["no_pdf"] else "",
+    return "".join(["--allow-unverified " if opts["allow_unverified"] else "", "--pdf " if opts["pdf"] else "",
+                    "--allow-spec-pdf " if opts["allow_spec_pdf"] else "",
                     "--max-pdf-mb %d " % opts["max_pdf_mb"] if opts["max_pdf_mb"] != 50 else ""])
 
 
 def pdf_plan(items, entries, opts):
-    """The PDF decision per new item: {item id: URLs import will try, in order}. Part of the import hash."""
-    if opts["no_pdf"]:
+    """The PDF decision per new item: {item id: https URLs import will try, in order}. Part of the import hash.
+    Nothing without --pdf. The spec's free-form `pdf` URL is tried first, but only with --allow-spec-pdf; otherwise
+    it is dropped, also from candidate lists written by older versions of verify, which mixed it in."""
+    if not opts["pdf"]:
         return {}
-    return {it["id"]: list(e["pdf_urls"]) for it, e in zip(items, entries) if e.get("pdf_urls")}
+    out = {}
+    for it, e in zip(items, entries):
+        spec_pdf = e.get("pdf")
+        urls = ([spec_pdf] if spec_pdf and opts["allow_spec_pdf"] else []) + [u for u in e.get("pdf_urls") or [] if u != spec_pdf]
+        urls = [u for u in dict.fromkeys(urls) if pdf_url_ok(u)]
+        if urls:
+            out[it["id"]] = urls
+    return out
 
 
 def import_payload(spec, b, opts):
@@ -1384,7 +1529,7 @@ def cmd_plan(a):
     spec = load_resolved(a.spec)
     opts = import_opts(a)
     b = build_import(spec, opts["allow_unverified"])
-    describe(spec, b)
+    describe(spec, b, opts)
     print("-- placement/tags of items already in the collection tree:")
     organize(spec, importable_entries(spec), spec.get("standalone_notes", []), dry=True)
     if b["items"]:
@@ -1399,12 +1544,12 @@ def cmd_import(a):
     b = build_import(spec, opts["allow_unverified"])
     items, entries = b["items"], b["entries"]
     if not items:
-        describe(spec, b)
+        describe(spec, b, opts)
         print("nothing to import")
         return
     confirm_or_exit("import", a.confirm, payload_hash(import_payload(spec, b, opts)), "plan SPEC")
     target, tname, session = connector_scope(spec["library"], spec.get("collection"))
-    describe(spec, b)
+    describe(spec, b, opts)
     pdfs = pdf_plan(items, entries, opts)
     connector("saveItems", {"sessionID": session, "uri": "http://localhost/zotero-skill", "items": items})
     connector("updateSession", {"sessionID": session, "target": target, "tags": ""})
@@ -1412,11 +1557,9 @@ def cmd_import(a):
     for it, e in zip(items, entries):
         if not pdfs.get(it["id"]):
             continue
-        url, body = fetch_pdf(pdfs[it["id"]])
+        url, body = fetch_pdf(pdfs[it["id"]], opts["max_pdf_mb"])
         if not body:
             print("  no PDF retrievable:", e.get("id")); continue
-        if len(body) > a.max_pdf_mb * 1e6:
-            print("  PDF too large, skipped (%.0f MB > %d):" % (len(body) / 1e6, a.max_pdf_mb), e.get("id"), url); continue
         meta = {"id": "a" + it["id"], "url": url, "contentType": "application/pdf", "parentItemID": it["id"],
                 "title": "Full Text PDF", "sessionID": session}
         connector("saveAttachment", headers={"Content-Type": "application/pdf", "X-Metadata": json.dumps(meta)}, data=body)
@@ -1467,7 +1610,10 @@ def main():
     def import_args(s):
         s.add_argument("spec")
         s.add_argument("--allow-unverified", action="store_true", help="also import user-affirmed entries with unverified (manual) metadata")
-        s.add_argument("--no-pdf", action="store_true"); s.add_argument("--max-pdf-mb", type=int, default=50)
+        s.add_argument("--pdf", action="store_true", help="fetch open-access PDFs (https only); off by default")
+        s.add_argument("--allow-spec-pdf", action="store_true", help="with --pdf: also try the spec's own free-form `pdf` URLs")
+        s.add_argument("--no-pdf", action="store_true", help=argparse.SUPPRESS)  # the default now; kept so old commands still parse
+        s.add_argument("--max-pdf-mb", type=int, default=50)
     s = sp.add_parser("plan", help="READ-ONLY: show what import would create and print the hash import --confirm needs; writes nothing")
     import_args(s); s.set_defaults(f=cmd_plan)
     s = sp.add_parser("import", help="write items/notes/PDFs via the connector (no Zotero dialog); needs --confirm HASH from plan")
