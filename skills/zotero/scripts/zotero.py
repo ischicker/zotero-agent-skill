@@ -320,6 +320,25 @@ def cmd_selftest(a):
     expect("log: fields", set(recs[0]) == {"ts", "command", "library", "collection", "method", "endpoint", "objects", "sha256", "status"})
     expect("log: count list payload", count_objects("/api/users/0/items", b'[{"key": "A"}, {"key": "B"}]') == 2)
 
+    # preflight: the row selected in the Zotero window (where saveItems lands first) must be an allowlisted collection
+    sel_targets = [{"id": "L1", "name": "My Library", "level": 0}, {"id": "C7", "name": "Skill-Test", "level": 1},
+                   {"id": "C8", "name": "Block 2", "level": 2}, {"id": "C9", "name": "Other", "level": 1},
+                   {"id": "L2", "name": "A Group", "level": 0}, {"id": "C20", "name": "Skill-Test", "level": 1}]
+    ids = library_target_ids({"targets": sel_targets}, "My Library", {"skill-test", "block 2"})
+    expect("preflight: ids of allowed colls", ids == {"C7", "C8"})
+    def sel(**kw):
+        return dict({"libraryID": 1, "libraryName": "My Library", "editable": True, "id": "C7", "name": "Skill-Test",
+                     "targets": sel_targets}, **kw)
+    for label, resp, must_block in [("preflight: allowed selected", sel(), False),
+                                    ("preflight: subcoll selected", sel(id="C8", name="Block 2"), False),
+                                    ("preflight: other coll selected", sel(id="C9", name="Other"), True),
+                                    ("preflight: same name, group", sel(id="C20", libraryID=2), True),
+                                    ("preflight: library root", sel(id=None, name="My Library"), True),
+                                    ("preflight: not editable", sel(editable=False), True),
+                                    ("preflight: no response", None, True),
+                                    ("preflight: malformed", {"targets": []}, True)]:
+        check(label, selected_target_problem(resp, ids) is not None, must_block)
+
     # UTF-8: umlauts survive a round trip, with or without a BOM; a legacy code page is refused, not mangled
     with tempfile.TemporaryDirectory() as td:
         spec_u = {"collection": "JoS SDG7", "entries": [{"claimed": {"title": "Fünf Kategorien: Fröste, Flüsse",
@@ -499,6 +518,8 @@ def connector(endpoint, payload=None, headers=None, data=None):
     h.update(headers or {})
     if data is None:
         data = json.dumps(payload if payload is not None else {}).encode()
+    if endpoint == "saveItems":
+        preflight_selected()  # saveItems lands in the window's selection first; see selected_target_problem
     body = http(HOST + "/connector/" + endpoint, data=data, headers=h, method="POST")
     return json.loads(body) if body.strip()[:1] in (b"{", b"[") else body
 
@@ -556,6 +577,50 @@ def connector_target(library, collection):
     if len(matches) == 1:
         return matches[0]["id"], matches[0]["name"]
     sys.exit("Collection %r in library %r: %d matches (names must be unique)" % (collection, library, len(matches)))
+
+
+def library_target_ids(sel, library, names):
+    """Connector target ids ('C288') of the collections of LIBRARY whose (lower-case) names are in NAMES, read from
+    a getSelectedCollection response. Library rows ('L1', level 0) start each library's block of collections."""
+    ids, in_lib = set(), False
+    for t in sel.get("targets") or []:
+        tid = str(t.get("id", ""))
+        if tid.startswith("L"):
+            in_lib = str(t.get("name", "")).lower() == library.lower() or (library.lower() in ("my library", "user") and tid == "L1")
+        elif in_lib and str(t.get("name", "")).lower() in names:
+            ids.add(tid)
+    return ids
+
+
+def selected_target_problem(sel, allowed_ids):
+    """None if the row selected in the Zotero window, as getSelectedCollection reports it, is an editable collection
+    whose target id is in ALLOWED_IDS; else why not. saveItems saves into exactly that row (server_connector.js:
+    getSaveTarget) before updateSession moves the items, so anything else could leave items outside the allowlist.
+    Fails closed: an unexpected response is a refusal."""
+    if not isinstance(sel, dict) or "id" not in sel or "editable" not in sel:
+        return "could not determine the collection selected in the Zotero window (unexpected connector response)"
+    if sel.get("editable") is not True:
+        return "the row selected in the Zotero window (%r) is not editable" % sel.get("name")
+    if not sel.get("id"):
+        return "the library root (%r) is selected in the Zotero window, not a collection" % sel.get("libraryName")
+    if sel["id"] not in allowed_ids:
+        return "the collection selected in the Zotero window (%r) is not on the allowlist" % sel.get("name")
+    return None
+
+
+def preflight_selected():
+    """Re-read the Zotero window's selection right before a connector save and refuse unless it is allowlisted.
+    switchToReadableLibrary=true makes Zotero resolve the target the way saveItems does (a read-only selection
+    falls back to My Library there)."""
+    try:
+        sel = connector("getSelectedCollection", {"switchToReadableLibrary": True})
+    except (urllib.error.URLError, ValueError) as ex:
+        sel = None
+        print("getSelectedCollection failed: %s" % ex, file=sys.stderr)
+    why = selected_target_problem(sel, CONNECTOR_SCOPE.get("allowed_ids", set()))
+    if why:
+        sys.exit("write refused: %s.\nSelect the target collection %r in the Zotero window, then run the command again."
+                 % (why, CONNECTOR_SCOPE.get("target_name")))
 
 
 # ---------------------------------------------------------------- identifier resolution
@@ -1046,8 +1111,12 @@ def connector_scope(library, collection):
     if collection_key(lp, collection) not in allowed:
         sys.exit("write refused: %s / %s is not in the allowlist %s" % (library, collection, config_path()))
     target, tname = connector_target(library, collection)
-    CONNECTOR_SCOPE.update(session="zskill-%d" % int(time.time()), target=target)
+    names = {c["data"]["name"].lower() for c in all_collections(lp) if c["key"] in allowed}
+    allowed_ids = library_target_ids(connector("getSelectedCollection"), library, names)
+    CONNECTOR_SCOPE.update(session="zskill-%d" % int(time.time()), target=target, target_name=tname,
+                           allowed_ids=allowed_ids)
     LOG_CONTEXT.update(library=library, collection=collection)
+    preflight_selected()  # refuse to start at all if the selection is wrong; checked again right before saveItems
     return target, tname, CONNECTOR_SCOPE["session"]
 
 
