@@ -5,14 +5,18 @@ Stdlib only. Talks to Zotero on 127.0.0.1:23119:
   * /api/...        local API; reads are open, writes need a per-request approval click in Zotero
   * /connector/...  browser-connector endpoints; `import` uses these (items, child notes, PDFs; no dialog)
 
-Read-only (GET to 127.0.0.1 only; enforced at runtime, see GUARD):
-    status | libs | colls LIB | ls LIB [COLL] | find LIB QUERY | notes LIB ITEM... | path LIB (ITEM... | --coll COLL) | plan SPEC | where [SPEC] | selftest
+Read-only (GET to Zotero on loopback only; enforced at runtime, see GUARD and canonical_host):
+    status | libs | colls LIB | ls LIB [COLL] | find LIB QUERY | notes LIB ITEM... | path LIB (ITEM... | --coll COLL)
+    | plan SPEC [flags] | where [SPEC] | allowlist | log [-n N] | selftest
 Network read, one local file (GET only, to Zotero + Crossref/arXiv/OpenAlex; enforced at runtime, see GUARD):
     verify SPEC        resolves identifiers; writes one output file (location: resolved_for()); never touches
                        Zotero. plan/import/organize take the same SPEC; `where SPEC` prints the location.
-Not read-only:
-    import SPEC        writes items/notes/PDFs through the connector (no dialog), then runs `organize`
-    organize SPEC      regular tags + subcollection placement (local-API writes: one dialog to create
+Not read-only (each write is checked against the user's allowlist file and logged; see `allowlist`, `log`):
+    import SPEC --confirm HASH
+                       writes items/notes (PDFs only with --pdf) through the connector (no dialog), then runs
+                       `organize`; HASH is what `plan` printed for the same spec and flags
+    organize SPEC (--dry-run | --confirm HASH)
+                       regular tags + subcollection placement (local-API writes: one dialog to create
                        subcollections, then one per 50 items); idempotent, also fixes earlier imports
     attach LIB FILE (--item KEY | --new ID)
                        local file -> existing item (local-API upload: 3 approval dialogs) or new item resolved
@@ -1033,7 +1037,13 @@ def local_authorize():
     print("Zotero will show an approval dialog - click Allow in the Zotero window (waiting up to 3 min)...", file=sys.stderr)
     body = http(HOST + "/api/local/authorize", data=json.dumps({"appName": "zotero skill"}).encode(), method="POST", timeout=180,
                 headers={"Zotero-API-Version": "3", "Zotero-Server-ID": sid, "Content-Type": "application/json"})
-    return {"Zotero-API-Version": "3", "Zotero-Server-ID": sid, "Zotero-API-Key": json.loads(body)["key"]}
+    grant = json.loads(body)
+    if grant.get("remember"):
+        print("WARNING: this approval was 'Always Allow'. Zotero now keeps a write key that never expires, in plain text "
+              "in localAPIKeys.json in the Zotero profile directory, and accepts it without a dialog from anything that "
+              "reads it. This skill does not reuse it. To revoke it: quit Zotero and remove the entries with "
+              '"remember": true from that file. Next time click Allow.', file=sys.stderr)
+    return {"Zotero-API-Version": "3", "Zotero-Server-ID": sid, "Zotero-API-Key": grant["key"]}
 
 
 def local_write(lib, items, kind="items"):
