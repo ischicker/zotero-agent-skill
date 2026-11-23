@@ -51,7 +51,7 @@ This safety is defended in depth (Zotero's own docs, the script's runtime guard,
 
 `verify SPEC` is not read-only, but it is bounded the same way: the runtime guard allows only HTTP GET to Zotero, `api.crossref.org`, `export.arxiv.org` and `api.openalex.org` (redirects included); it sends only the DOI/arXiv identifiers (never titles or notes); it only pings Zotero (to check the version) and never reads or changes the library; and its one write is its output file, in the private temp directory described in the Verify step. `selftest` proves the guard.
 
-Deliberately not pre-approved: `import`, `organize`, `attach`, `trash`, `write`.
+Deliberately not pre-approved: `import`, `organize`, `attach`, `trash`.
 
 ## The rule: never type bibliographic metadata
 
@@ -78,19 +78,7 @@ The library is a human's working space; write what a human would write by hand.
 
 ## Adding a note to an item already in Zotero
 
-`import` only creates notes together with a new item. For a reference that is already in the library, use `write` with a *new* object (no `key`, no `version`) instead of an update:
-
-```json
-[{"itemType": "note", "parentItem": "PARENTKEY", "note": "<h1>Title: what and where from (LLM-generated, unreviewed)</h1><p>...</p>", "tags": [{"tag": "needs review"}]}]
-```
-
-`write LIB note.json`. The parent is not modified; the note is a new child. Follow the note conventions under Zotero-native (first line is the title; label LLM text; HTML, so wrap plain prose in `<p>` and escape `<`, `&`). Tags on the note are optional and come out regular (the automatic-tag problem is connector-only).
-
-- Get `PARENTKEY` with `find LIB QUERY`; it must be a regular item, not an attachment or note (`attach --item` refuses those, and notes are not meant to nest).
-- Several notes (on different parents too) go in ONE array: one dialog, max 50.
-- No dedupe. `write` creates whatever it is given, so running it twice makes two notes. First run `notes LIB PARENTKEY...` (read-only; `--full` for whole texts) and do not add a note that is already there.
-- `write` prints the key of each object it created; check with `notes LIB PARENTKEY`. To remove a mistaken note, `trash LIB NOTEKEY`.
-- Same mechanism as `attach --item`, which creates its attachment as a child the same way.
+`import` only creates notes together with a new item. There is currently no command for adding a note to an existing item: the generic `write` command (arbitrary JSON to the local API) was removed because it could change any object in any library. Tell the user and do not work around it with ad-hoc HTTP requests.
 
 ## Write commands and the modal
 
@@ -101,6 +89,5 @@ The library is a human's working space; write what a human would write by hand.
 | `attach LIB FILE --new ID` | connector (item + stored file) | none |
 | `attach LIB FILE --item KEY` | local API: create attachment, upload file | 3 (one per request) |
 | `trash LIB KEY...` | local API (`deleted:1`, reversible) | 1 per request |
-| `write LIB FILE.json` | local API: array of `{key, version, ...fields}` to update, or new objects without `key` to create | 1 per request (max 50 objects) |
 
-The dialog is the user's review gate and the key is single-use: put related edits in ONE request and say how many dialogs to expect; never loop single-item writes. Moving an item to another collection: `write` `[{"key":"K","version":12,"collections":["C1","C2"]}]` (replaces membership; read current `collections` first).
+The dialog is the user's review gate and the key is single-use: put related edits in ONE request and say how many dialogs to expect; never loop single-item writes. Moving items between subcollections: give the entries `subcollection` in the spec and run `organize`.

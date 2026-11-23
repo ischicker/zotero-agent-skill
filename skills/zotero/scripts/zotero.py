@@ -17,7 +17,7 @@ Not read-only:
     attach LIB FILE (--item KEY | --new ID)
                        local file -> existing item (local-API upload: 3 approval dialogs) or new item resolved
                        from a DOI/arXiv ID (connector: no dialog), in one call
-    trash | write      local-API writes (one approval dialog per request)
+    trash LIB KEY...   local-API write (one approval dialog per request)
 
 Design rule: the model never types bibliographic metadata. It supplies identifiers
 (DOI / arXiv ID); metadata comes from Crossref / arXiv and is compared with what the
@@ -426,8 +426,7 @@ def cmd_find(a):
 
 
 def cmd_notes(a):
-    """Child notes of each ITEM (key, dates, tags, text); an ITEM that is itself a note is shown as is. Use before adding
-    a note with `write`, which does not dedupe."""
+    """Child notes of each ITEM (key, dates, tags, text); an ITEM that is itself a note is shown as is."""
     lp = lib_path(a.lib)
     n = 0
     for k in a.items:
@@ -666,15 +665,6 @@ def cmd_trash(a):
         objs.append({"key": k, "version": it["version"], "deleted": 1})
     r = local_write(a.lib, objs)
     print("trashed:", sorted(r.get("successful", {}) and [v["key"] for v in r["successful"].values()]), "failed:", r.get("failed"))
-
-
-def cmd_write(a):
-    r = local_write(a.lib, json.load(open(a.json)), kind="collections" if a.collections else "items")
-    print("successful: %d | unchanged: %d | failed: %d" % (len(r.get("successful", {})), len(r.get("unchanged", {})), len(r.get("failed", {}))))
-    for i, v in sorted((r.get("successful") or {}).items(), key=lambda kv: int(kv[0])):
-        print("  object %s -> %s" % (i, v.get("key")))
-    for k, v in (r.get("failed") or {}).items():
-        print("  failed %s: %s" % (k, v))
 
 
 def run_dir(create=False):
@@ -1056,7 +1046,7 @@ def main():
     s = sp.add_parser("colls"); s.add_argument("lib"); s.set_defaults(f=cmd_colls)
     s = sp.add_parser("ls"); s.add_argument("lib"); s.add_argument("coll", nargs="?"); s.set_defaults(f=cmd_ls)
     s = sp.add_parser("find"); s.add_argument("lib"); s.add_argument("query"); s.set_defaults(f=cmd_find)
-    s = sp.add_parser("notes", help="child notes of the ITEMs (key, dates, tags, text); check before adding one with `write`")
+    s = sp.add_parser("notes", help="child notes of the ITEMs (key, dates, tags, text)")
     s.add_argument("lib"); s.add_argument("items", nargs="+", metavar="ITEM"); s.add_argument("--full", action="store_true", help="whole note text, not 200 chars")
     s.set_defaults(f=cmd_notes)
     s = sp.add_parser("path", help="local file path(s) of attachments: of the ITEMs (parent or attachment keys), or of all in --coll; flags missing files")
@@ -1079,9 +1069,6 @@ def main():
     s.add_argument("--coll", help="with --new: collection to put it in (default: library root)"); s.add_argument("--title", help="attachment title (default: Full Text PDF / file name)")
     s.add_argument("--max-mb", type=int, default=50); s.set_defaults(f=cmd_attach)
     s = sp.add_parser("trash", help="move items to Zotero's trash (one approval dialog)"); s.add_argument("lib"); s.add_argument("keys", nargs="+"); s.set_defaults(f=cmd_trash)
-    s = sp.add_parser("write", help="POST a JSON array of item (or --collections) objects via the local API (one approval dialog)"); s.add_argument("lib"); s.add_argument("json")
-    s.add_argument("--collections", action="store_true", help="the objects are collections ({key, version, name, ...}), not items")
-    s.set_defaults(f=cmd_write)
     a = p.parse_args()
     global GUARD
     GUARD = LOCAL_ONLY if a.cmd in READ_ONLY_CMDS else REMOTE_READ if a.cmd in VERIFY_CMDS else None

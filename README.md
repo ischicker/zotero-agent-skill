@@ -63,7 +63,7 @@ Location. Source of truth is this repo; `~/.agents/skills/zotero` is a symlink t
 - The `Zotero < 10` branch of the version gate is untested (no older Zotero available).
 - Whether Claude Code's permission matcher expands `${CLAUDE_SKILL_DIR}` through the symlink chain in `allowed-tools` was not verified in-session; check that the pre-approved commands (read-only ones, `verify` and `where`) run without prompts in a fresh session.
 - Pipeline scripts used for the CogSec doc (doc text -> spec JSON, note retrofit) were one-offs and are not included; the shape is `references/spec-example.json`.
-- No `update` for existing item *fields*; `write` is the generic escape (array of `{key, version, ...}`; objects without `key` create, e.g. a child note on an existing item, which has no dedupe).
+- No `update` for existing item *fields*. The generic `write` escape (arbitrary JSON objects to the local API) was removed in this fork: it could change any object in any library, which no allowlist or plan hash can bound.
 - Possible: PDF annotation import, Unpaywall (needs an email), per-entry target collections, a `find` that searches the whole subtree.
 
 ## References
