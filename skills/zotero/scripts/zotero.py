@@ -81,7 +81,7 @@ SIM_OK = 0.85
 GUARD = None
 LOCAL_ONLY = (HOST + "/",)
 REMOTE_READ = LOCAL_ONLY + ("https://api.crossref.org/", "https://export.arxiv.org/", "https://api.openalex.org/")
-READ_ONLY_CMDS = {"status", "libs", "colls", "ls", "find", "notes", "path", "plan", "where", "selftest", "allowlist", "log"}  # GUARD = LOCAL_ONLY
+READ_ONLY_CMDS = {"status", "libs", "colls", "ls", "find", "notes", "path", "plan", "where", "selftest", "allowlist", "log", "export"}  # GUARD = LOCAL_ONLY
 VERIFY_CMDS = {"verify", "resolve"}                                                       # GUARD = REMOTE_READ
 
 
@@ -391,6 +391,40 @@ def cmd_selftest(a):
         if os.name == "posix":
             os.chmod(p_cfg, 0o600)
         expect("utf-8: allowlist with BOM", load_config(p_cfg)[1] is None)
+
+    # export: CSV rows from canned item data; quoting, umlauts, several authors, collection names; --out rules
+    import csv, io
+    names_x = {"B1": "Block 1", "D13": "D1.3_Ch8_S2S_seasonal (1)"}
+    items_x = {"K1": {"itemType": "journalArticle", "title": "Fünf Kategorien, \"Fröste\" und Flüsse", "DOI": "10.1/x",
+                      "date": "2024-08-23", "creators": [{"creatorType": "author", "lastName": "Bjerregård", "firstName": "Jakob"},
+                                                         {"creatorType": "author", "lastName": "Möhrlen", "firstName": "C."},
+                                                         {"creatorType": "editor", "lastName": "Ed", "firstName": "E."}],
+                      "tags": [{"tag": "prio:muss"}, {"tag": "decision:offen"}], "collections": ["B1", "D13"]},
+               "K2": {"itemType": "report", "title": "Bericht", "date": "", "creators": [{"creatorType": "author", "name": "IEA Wind"}],
+                      "tags": [], "collections": ["B1"]}}
+    rows = export_rows(items_x, names_x)
+    buf = io.StringIO()
+    csv.writer(buf, lineterminator="\n").writerows([EXPORT_COLUMNS] + rows)
+    back = list(csv.reader(io.StringIO(buf.getvalue())))
+    expect("export: csv round trip", back[1:] == rows and back[0] == EXPORT_COLUMNS)
+    expect("export: authors, no editor", rows[0][3] == "Bjerregård, Jakob; Möhrlen, C.")
+    expect("export: title with comma/quote", rows[0][2] == "Fünf Kategorien, \"Fröste\" und Flüsse")
+    expect("export: year, tags, colls", rows[0][4:] == ["2024", "decision:offen; prio:muss", "Block 1; D1.3_Ch8_S2S_seasonal (1)"])
+    expect("export: single-field name", rows[1][3] == "IEA Wind" and rows[1][4] == "")
+    with tempfile.TemporaryDirectory() as td:
+        existing = os.path.join(td, "a.csv")
+        open(existing, "w").close()
+        check("export: --out new .csv", export_out_problem(os.path.join(td, "new.csv"), "csv") is not None, False)
+        check("export: --out existing file", export_out_problem(existing, "csv") is not None, True)
+        check("export: --out wrong extension", export_out_problem(os.path.join(td, "x.py"), "csv") is not None, True)
+        check("export: --out .bib for bibtex", export_out_problem(os.path.join(td, "x.bib"), "bibtex") is not None, False)
+    bib = ("@article{a_x_2024,\n\ttitle = {T {Europe}},\n\tannote = {<h1>LLM note</h1><p>{nested} braces</p>},\n\tdoi = {10.1/x},\n}\n"
+           "@book{b_y_2020,\n\tannote = {only field},\n}\n")
+    stripped = strip_bibtex_field(bib, "annote")
+    expect("export: annote dropped", "annote" not in stripped and "LLM note" not in stripped)
+    expect("export: other fields kept", "title = {T {Europe}}" in stripped and "doi = {10.1/x}" in stripped and "@book{b_y_2020" in stripped)
+    check("export: GET bibtex local", read_only_violation(h + "/api/users/0/items?format=bibtex&itemKey=A,B", None, None) is not None, False)
+    expect("export: is read-only", "export" in READ_ONLY_CMDS)
 
     # organize keeps tags it does not manage; single-value screening prefixes are replaced, not duplicated
     cur = [{"tag": "D1.3-Ch8", "type": 0}, {"tag": "Physics - Atmospheric and Oceanic Physics", "type": 1},
@@ -937,6 +971,113 @@ def cmd_path(a):
         found += ok
         print("\t".join(["ok" if ok else "missing"] + row + [path]))
     print("-- %d attachments, %d on disk" % (len(atts), found))
+
+
+# ---------------------------------------------------------------- export (read-only): a collection as CSV or BibTeX
+EXPORT_COLUMNS = ["key", "DOI", "title", "authors", "year", "tags", "collections"]
+
+
+def collection_tree(lp, name, recursive=True):
+    """([collection keys: NAME first, then its subcollections], {key: name} for the whole library)."""
+    colls = all_collections(lp)
+    root = collection_key(lp, name)
+    keys, frontier = [root], [root]
+    while recursive and frontier:
+        frontier = sorted(c["key"] for c in colls if c["data"].get("parentCollection") in frontier and c["key"] not in keys)
+        keys += frontier
+    return keys, {c["key"]: c["data"]["name"] for c in colls}
+
+
+def tree_items(lp, keys):
+    """{item key: data} of the top-level regular items in the given collections (no notes, no attachments)."""
+    out = {}
+    for k in keys:
+        start = 0
+        while True:
+            page, hdr = zget(lp + "/collections/%s/items/top" % k, limit=100, start=start, include="data")
+            for i in page:
+                if i["data"].get("itemType") not in ("note", "attachment"):
+                    out.setdefault(i["key"], i["data"])
+            start += len(page)
+            if not page or start >= int(hdr.get("Total-Results", start)):
+                break
+    return out
+
+
+def export_rows(items, names):
+    """CSV rows (EXPORT_COLUMNS) for items {key: data}, sorted by first author, year, title. Pure; selftest calls it."""
+    rows = []
+    for k, d in items.items():
+        people = [c for c in d.get("creators", []) if c.get("creatorType") == "author"] or d.get("creators", [])
+        authors = "; ".join(", ".join(x for x in (c.get("lastName") or c.get("name", ""), c.get("firstName", "")) if x)
+                            for c in people)
+        year = (re.search(r"\d{4}", d.get("date") or "") or [""])[0]
+        rows.append([k, d.get("DOI", ""), d.get("title", ""), authors, year,
+                     "; ".join(sorted((t["tag"] for t in d.get("tags", [])), key=str.lower)),
+                     "; ".join(sorted((names.get(c, c) for c in d.get("collections", [])), key=str.lower))])
+    return sorted(rows, key=lambda r: (r[3].lower(), r[4], r[2].lower()))
+
+
+def strip_bibtex_field(text, field):
+    """TEXT without every `field = {...}` (braces balanced), e.g. Zotero's `annote`, which carries the child notes.
+    Pure; selftest calls it."""
+    out, i, pat = [], 0, re.compile(r"\n[ \t]*%s[ \t]*=[ \t]*\{" % re.escape(field), re.I)
+    while True:
+        m = pat.search(text, i)
+        if not m:
+            out.append(text[i:])
+            return "".join(out)
+        out.append(text[i:m.start()])
+        depth, j = 1, m.end()
+        while j < len(text) and depth:
+            depth += {"{": 1, "}": -1}.get(text[j], 0)
+            j += 1
+        if text[j:j + 1] == ",":
+            j += 1
+        i = j
+
+
+def export_out_problem(path, fmt):
+    """None if PATH is a new file with the extension for FMT; else why --out refuses it (never overwrites)."""
+    ext = {"csv": ".csv", "bibtex": ".bib"}[fmt]
+    if not path.lower().endswith(ext):
+        return "--out for --format %s must end in %s" % (fmt, ext)
+    if os.path.lexists(path):
+        return "%s exists; export never overwrites, choose a new name" % path
+    return None
+
+
+def cmd_export(a):
+    """Read-only: a collection (with its subcollections unless --no-recursive) as CSV or BibTeX (Zotero's own BibTeX
+    translator, via the local API's format=bibtex). Output to stdout, or to a NEW file given with --out."""
+    lp = lib_path(a.lib)
+    keys, names = collection_tree(lp, a.coll, not a.no_recursive)
+    items = tree_items(lp, keys)
+    if a.format == "csv":
+        import csv, io
+        buf = io.StringIO()
+        w = csv.writer(buf, lineterminator="\n")
+        w.writerow(EXPORT_COLUMNS)
+        w.writerows(export_rows(items, names))
+        text = buf.getvalue()
+    else:
+        ks, parts = sorted(items), []
+        for i in range(0, len(ks), 50):
+            parts.append(http(HOST + "/api" + lp + "/items?" + urllib.parse.urlencode(
+                {"format": "bibtex", "itemKey": ",".join(ks[i:i + 50])}), headers={"Zotero-API-Version": "3"}).decode("utf-8"))
+        text = "\n".join(p.strip("\n") for p in parts if p.strip()) + "\n"
+        if not a.keep_notes:  # Zotero puts child notes (often LLM-written, unreviewed) into `annote`
+            text = strip_bibtex_field(text, "annote")
+    if a.out:
+        why = export_out_problem(a.out, a.format)
+        if why:
+            sys.exit("export refused: " + why)
+        with open(a.out, "x", encoding="utf-8-sig" if a.format == "csv" else "utf-8", newline="") as f:
+            f.write(text)
+        print("wrote %d items from %d collection(s) to %s" % (len(items), len(keys), a.out), file=sys.stderr)
+    else:
+        sys.stdout.write(text)
+        print("-- %d items from %d collection(s)" % (len(items), len(keys)), file=sys.stderr)
 
 
 def note_present(html_note, existing_texts, threshold=0.8):
@@ -2162,6 +2303,13 @@ def main():
         s.add_argument("--allow-spec-pdf", action="store_true", help="with --pdf: also try the spec's own free-form `pdf` URLs")
         s.add_argument("--no-pdf", action="store_true", help=argparse.SUPPRESS)  # the default now; kept so old commands still parse
         s.add_argument("--max-pdf-mb", type=int, default=50)
+    s = sp.add_parser("export", help="READ-ONLY: a collection (and its subcollections) as CSV or BibTeX, to stdout or a new file (--out)")
+    s.add_argument("lib"); s.add_argument("coll")
+    s.add_argument("--format", choices=("csv", "bibtex"), default="csv")
+    s.add_argument("--no-recursive", action="store_true", help="only the collection itself, not its subcollections")
+    s.add_argument("--out", help="new .csv/.bib file to write (UTF-8; never overwrites); default stdout")
+    s.add_argument("--keep-notes", action="store_true", help="bibtex: keep Zotero's annote fields (child notes); dropped by default")
+    s.set_defaults(f=cmd_export)
     s = sp.add_parser("resolve", help="NETWORK READ: candidate DOIs/arXiv IDs for entries with `claimed` but no `id` (Crossref, arXiv); writes a proposal file, edits no spec")
     s.add_argument("file", help="pending file with needs_id, or a spec whose entries lack id"); s.set_defaults(f=cmd_resolve)
     s = sp.add_parser("plan", help="READ-ONLY: show what import would create and print the hash import --confirm needs; writes nothing")
