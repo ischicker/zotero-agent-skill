@@ -1,5 +1,18 @@
 # zotero-agent-skill
 
+## Based on
+
+This is a fork of [glass-bead-labs/zotero-agent-skill](https://github.com/glass-bead-labs/zotero-agent-skill) by Dav Clark. The design, the reasoning below and almost all of the code are his. This fork, made for literature screening in a local Zotero 10 library, hardens the write side while keeping the structure (skill + one stdlib-only CLI):
+
+- `ZOTERO_HOST` must be loopback, because the read-only guard trusts every URL under it.
+- The generic `write` command is gone; a narrow `note` command adds child notes to existing items.
+- Every write is checked against a user-owned allowlist file outside the repo, and fails closed without it.
+- `import`, `organize` and `note` only write with `--confirm HASH` from the reviewed dry run.
+- PDFs are off by default and https-only; `attach` only reads files from allowed directories.
+- Every write request is logged (metadata and a payload hash, no content).
+
+Why: the connector path shows no Zotero dialog, and an agent can be steered by text in fetched records, so the bounds on writes should be in the code, not only in the instructions. Each change is a separate commit on the `hardening` branch, written so it can be offered upstream as a pull request (see `UPSTREAM_ISSUE.md`). The upstream repository has no licence file; that question is the author's to answer.
+
 An agent skill plus a small stdlib-only CLI for working with a local Zotero 10+ library from Claude Code (or any agent that reads [Agent Skills](https://agentskills.io)): look things up, and import references with verified metadata, child notes, native tags, subcollections and open-access PDFs.
 
 ```
