@@ -217,6 +217,39 @@ def cmd_selftest(a):
     finally:
         AUTHORIZED_LIBS.clear(); AUTHORIZED_LIBS.update(saved_libs)
         CONNECTOR_SCOPE.clear(); CONNECTOR_SCOPE.update(saved_scope)
+
+    # plan hash: canonical, and any change to what import would send changes it
+    def fake(tag="x", url="https://arxiv.org/pdf/1", sub="Block 1"):
+        return ({"library": "My Library", "collection": "Skill-Test"},
+                {"coll_key": "SKT", "kind": 0, "n_entries": 1,
+                 "items": [{"id": "i1", "itemType": "preprint", "title": "T", "tags": [{"tag": tag, "type": 0}], "notes": []}],
+                 "entries": [{"pdf_urls": [url], "subcollection": sub}]})
+    base_opts = {"allow_unverified": False, "no_pdf": False, "max_pdf_mb": 50}
+    def expect(label, cond):
+        nonlocal bad
+        bad += not cond
+        print("%-30s %s" % (label, "ok" if cond else "FAIL"))
+    ref = payload_hash(import_payload(*fake(), base_opts))
+    expect("hash: key order irrelevant", payload_hash({"a": 1, "b": [1, 2]}) == payload_hash({"b": [1, 2], "a": 1}))
+    expect("hash: list order counts", payload_hash([1, 2]) != payload_hash([2, 1]))
+    for label, payload in [("hash: one tag changed", import_payload(*fake(tag="y"), base_opts)),
+                           ("hash: PDF URL changed", import_payload(*fake(url="https://arxiv.org/pdf/2"), base_opts)),
+                           ("hash: subcollection changed", import_payload(*fake(sub="Block 2"), base_opts)),
+                           ("hash: --no-pdf", import_payload(*fake(), dict(base_opts, no_pdf=True))),
+                           ("hash: --max-pdf-mb", import_payload(*fake(), dict(base_opts, max_pdf_mb=10))),
+                           ("hash: --allow-unverified", import_payload(*fake(), dict(base_opts, allow_unverified=True)))]:
+        expect(label + " -> differs", payload_hash(payload) != ref)
+    for label, given, must_block in [("confirm: matching hash", ref, False), ("confirm: upper case", ref.upper(), False),
+                                     ("confirm: missing", None, True), ("confirm: other hash", "0" * 64, True)]:
+        try:
+            confirm_or_exit("import", given, ref, "plan SPEC")
+            blocked = False
+        except SystemExit as ex:
+            blocked = True
+            if ref in str(ex.code):
+                print("confirm: refusal leaks the expected hash FAIL")
+                bad += 1
+        check(label, blocked, must_block)
     print("read-only commands:", ", ".join(sorted(READ_ONLY_CMDS)))
     print("network-read commands:", ", ".join(sorted(VERIFY_CMDS)))
     sys.exit(1 if bad else 0)
@@ -1164,13 +1197,15 @@ def subcolls_of(e):
     return [] if not v else ([v] if isinstance(v, str) else list(v))
 
 
-def organize(spec, entries, note_htmls, dry=False):
-    """Bring items already in the target collection tree to the spec's state (local-API writes).
+def organize_plan(spec, entries, note_htmls):
+    """Pure planning (GET only): what organize would send to bring items already in the target collection tree to
+    the spec's state.
 
     * tags: set as regular (manual) tags, because the connector forces automatic ones;
     * placement: items with `subcollection` are MOVED out of the parent collection into those
       subcollections (created when missing); memberships outside this tree are preserved.
-    One approval dialog to create subcollections, then one per 50 items."""
+    Subcollections that do not exist yet appear as "NEW:<name>" in the objects; organize() substitutes the real
+    keys after creating them, so what is hashed is what is sent."""
     lp = lib_path(spec["library"])
     parent = collection_key(lp, spec["collection"]) if spec.get("collection") else None
     kind = 1 if spec.get("tag_type") == "automatic" else 0
@@ -1182,22 +1217,8 @@ def organize(spec, entries, note_htmls, dry=False):
             if n.lower() not in [w.lower() for w in want_names]:
                 want_names.append(n)
     missing = sorted(n for n in want_names if n.lower() not in subs)
-    if missing:
-        print("subcollections to create under %r: %s" % (spec["collection"], missing))
-        if dry:
-            for n in missing:
-                subs[n.lower()] = "NEW:" + n
-        else:
-            try:
-                r = local_write(spec["library"], [{"name": n, "parentCollection": parent} for n in missing], kind="collections")
-            except TimeoutError:
-                sys.exit("subcollections NOT created (no approval within 3 min); run `organize` again")
-            made = r.get("success") or {k: v["key"] for k, v in r.get("successful", {}).items()}
-            if len(made) != len(missing):
-                sys.exit("could not create all subcollections: %s" % json.dumps(r.get("failed")))
-            for i, n in enumerate(missing):
-                subs[n.lower()] = made[str(i)]
-            print("  created %d subcollections" % len(missing))
+    for n in missing:
+        subs[n.lower()] = "NEW:" + n
     tree_keys = ({parent} if parent else set()) | {k for k in subs.values() if not k.startswith("NEW:")}
 
     # items that currently live anywhere in the tree (parent + its subcollections)
@@ -1255,15 +1276,67 @@ def organize(spec, entries, note_htmls, dry=False):
         best = max(notes, key=lambda rt: difflib.SequenceMatcher(None, mine, rt[1]).ratio(), default=None)
         ok = best and difflib.SequenceMatcher(None, mine, best[1]).ratio() >= 0.8
         plan_change(best[0] if ok else None, spec.get("tags", []), [], "standalone note")
+    return {"parent": parent, "create": missing, "objs": objs, "moves": moves, "missing_items": missing_items}
+
+
+def payload_hash(obj):
+    """SHA-256 over a canonical serialisation (sorted keys, no whitespace, UTF-8) of what a write would send."""
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def organize_payload(spec, p):
+    return {"library": spec["library"], "collection": spec.get("collection"), "parent_key": p["parent"],
+            "create_subcollections": p["create"], "objects": p["objs"]}
+
+
+def confirm_or_exit(cmd, given, expected, how):
+    """Refuse unless the user-approved hash matches. The expected hash is deliberately not printed here: it must
+    come from the reviewed plan output, not from an error message."""
+    if given and given.strip().lower() == expected:
+        return
+    why = "--confirm HASH is required" if not given else \
+        "--confirm %s does not match what %s would send now (the spec, flags or library changed)" % (given, cmd)
+    sys.exit("%s refused: %s.\nRun `%s` with the same flags, show the user its output, and use the hash it prints."
+             % (cmd, why, how))
+
+
+def organize(spec, entries, note_htmls, dry=False, confirm=None, bound_by_import=False):
+    """Plan, show, and (unless dry) send organize's local-API writes: one approval dialog to create subcollections,
+    then one per 50 items. A standalone run must be confirmed with the hash of the plan (--confirm); after
+    `import`, the import hash already covers the intent and the items did not exist when it was computed."""
+    p = organize_plan(spec, entries, note_htmls)
+    objs = p["objs"]
+    if p["create"]:
+        print("subcollections to create under %r: %s" % (spec["collection"], p["create"]))
     print("organize: %d items to update (%d tag changes, %d placements), %d not found in the collection tree" %
-          (len(objs), sum(1 for o in objs if "tags" in o), len(moves), len(missing_items)))
-    for m in missing_items:
+          (len(objs), sum(1 for o in objs if "tags" in o), len(p["moves"]), len(p["missing_items"])))
+    for m in p["missing_items"]:
         print("  not found:", m)
+    h = payload_hash(organize_payload(spec, p))
     if dry:
         from collections import Counter
-        for name, c in sorted(Counter(n for _, ns in moves for n in ns).items()):
+        for name, c in sorted(Counter(n for _, ns in p["moves"] for n in ns).items()):
             print("  -> %-50s %d item(s)" % (name, c))
-        return
+        if objs or p["create"]:
+            print("organize hash (organize SPEC --confirm): %s" % h)
+        return h
+    if not objs and not p["create"]:
+        return h
+    if not bound_by_import:
+        confirm_or_exit("organize", confirm, h, "organize SPEC --dry-run")
+    if p["create"]:
+        try:
+            r = local_write(spec["library"], [{"name": n, "parentCollection": p["parent"]} for n in p["create"]], kind="collections")
+        except TimeoutError:
+            sys.exit("subcollections NOT created (no approval within 3 min); run `organize` again")
+        made = r.get("success") or {k: v["key"] for k, v in r.get("successful", {}).items()}
+        if len(made) != len(p["create"]):
+            sys.exit("could not create all subcollections: %s" % json.dumps(r.get("failed")))
+        real = {"NEW:" + n: made[str(i)] for i, n in enumerate(p["create"])}
+        for o in objs:
+            if "collections" in o:
+                o["collections"] = [real.get(k, k) for k in o["collections"]]
+        print("  created %d subcollections" % len(p["create"]))
     for i in range(0, len(objs), 50):
         try:
             r = local_write(spec["library"], objs[i:i + 50])
@@ -1278,31 +1351,68 @@ def organize(spec, entries, note_htmls, dry=False):
 
 def cmd_organize(a):
     spec = load_resolved(a.spec)
-    organize(spec, importable_entries(spec), spec.get("standalone_notes", []), dry=a.dry_run)
+    organize(spec, importable_entries(spec), spec.get("standalone_notes", []), dry=a.dry_run, confirm=a.confirm)
+
+
+def import_opts(a):
+    """The flags plan and import share; they are part of the import hash, so both must be given the same ones."""
+    return {"allow_unverified": bool(a.allow_unverified), "no_pdf": bool(a.no_pdf), "max_pdf_mb": a.max_pdf_mb}
+
+
+def import_flags(opts):
+    return "".join(["--allow-unverified " if opts["allow_unverified"] else "", "--no-pdf " if opts["no_pdf"] else "",
+                    "--max-pdf-mb %d " % opts["max_pdf_mb"] if opts["max_pdf_mb"] != 50 else ""])
+
+
+def pdf_plan(items, entries, opts):
+    """The PDF decision per new item: {item id: URLs import will try, in order}. Part of the import hash."""
+    if opts["no_pdf"]:
+        return {}
+    return {it["id"]: list(e["pdf_urls"]) for it, e in zip(items, entries) if e.get("pdf_urls")}
+
+
+def import_payload(spec, b, opts):
+    """Exactly what import would send, as one object: target, items (with child notes and tags), standalone
+    notes, the follow-up placement, and the PDF decisions. plan prints its hash; import recomputes and compares."""
+    return {"target": {"library": spec["library"], "collection": spec.get("collection"), "collection_key": b["coll_key"]},
+            "items": b["items"], "tag_type": b["kind"],
+            "placement": {it["id"]: subcolls_of(e) for it, e in zip(b["items"], b["entries"])},
+            "pdf": {"policy": opts, "per_item": pdf_plan(b["items"], b["entries"], opts)}}
 
 
 def cmd_plan(a):
     spec = load_resolved(a.spec)
-    describe(spec, build_import(spec, True))
+    opts = import_opts(a)
+    b = build_import(spec, opts["allow_unverified"])
+    describe(spec, b)
     print("-- placement/tags of items already in the collection tree:")
     organize(spec, importable_entries(spec), spec.get("standalone_notes", []), dry=True)
+    if b["items"]:
+        print("plan hash (import SPEC %s--confirm): %s" % (import_flags(opts), payload_hash(import_payload(spec, b, opts))))
+    else:
+        print("nothing to import")
 
 
 def cmd_import(a):
     spec = load_resolved(a.spec)
-    b = build_import(spec, a.allow_unverified)
-    target, tname, session = connector_scope(spec["library"], spec.get("collection"))
-    describe(spec, b)
+    opts = import_opts(a)
+    b = build_import(spec, opts["allow_unverified"])
     items, entries = b["items"], b["entries"]
     if not items:
+        describe(spec, b)
+        print("nothing to import")
         return
+    confirm_or_exit("import", a.confirm, payload_hash(import_payload(spec, b, opts)), "plan SPEC")
+    target, tname, session = connector_scope(spec["library"], spec.get("collection"))
+    describe(spec, b)
+    pdfs = pdf_plan(items, entries, opts)
     connector("saveItems", {"sessionID": session, "uri": "http://localhost/zotero-skill", "items": items})
     connector("updateSession", {"sessionID": session, "target": target, "tags": ""})
     got = 0
     for it, e in zip(items, entries):
-        if a.no_pdf or not e.get("pdf_urls"):
+        if not pdfs.get(it["id"]):
             continue
-        url, body = fetch_pdf(e["pdf_urls"])
+        url, body = fetch_pdf(pdfs[it["id"]])
         if not body:
             print("  no PDF retrievable:", e.get("id")); continue
         if len(body) > a.max_pdf_mb * 1e6:
@@ -1315,7 +1425,7 @@ def cmd_import(a):
     print("imported %d items (+%d standalone notes), %d PDFs -> %s" % (b["n_entries"], len(items) - b["n_entries"], got, tname))
     if (b["kind"] == 0 and any(i.get("tags") for i in items)) or any(subcolls_of(e) for e in entries):
         print("placing items and setting regular tags: Zotero will ask for approval...")
-        organize(spec, entries, [i["note"] for i in items if i.get("itemType") == "note"])
+        organize(spec, entries, [i["note"] for i in items if i.get("itemType") == "note"], bound_by_import=True)
 
 
 ZOTERO_VERSION = None
@@ -1354,13 +1464,18 @@ def main():
     s = sp.add_parser("verify", help="resolve IDs via Crossref/arXiv; output goes to a private temp dir (see `where SPEC`)")
     s.add_argument("spec")
     s.add_argument("--no-pdf", action="store_true"); s.set_defaults(f=cmd_verify)
-    s = sp.add_parser("plan", help="READ-ONLY: show what import would create; writes nothing"); s.add_argument("spec"); s.set_defaults(f=cmd_plan)
-    s = sp.add_parser("import", help="write items/notes/PDFs via the connector (no Zotero dialog)"); s.add_argument("spec")
-    s.add_argument("--allow-unverified", action="store_true", help="also import user-affirmed entries with unverified (manual) metadata")
-    s.add_argument("--no-pdf", action="store_true"); s.add_argument("--max-pdf-mb", type=int, default=50)
+    def import_args(s):
+        s.add_argument("spec")
+        s.add_argument("--allow-unverified", action="store_true", help="also import user-affirmed entries with unverified (manual) metadata")
+        s.add_argument("--no-pdf", action="store_true"); s.add_argument("--max-pdf-mb", type=int, default=50)
+    s = sp.add_parser("plan", help="READ-ONLY: show what import would create and print the hash import --confirm needs; writes nothing")
+    import_args(s); s.set_defaults(f=cmd_plan)
+    s = sp.add_parser("import", help="write items/notes/PDFs via the connector (no Zotero dialog); needs --confirm HASH from plan")
+    import_args(s); s.add_argument("--confirm", metavar="HASH", help="the hash `plan` printed for the same spec and flags")
     s.set_defaults(f=cmd_import)
     s = sp.add_parser("organize", help="set tags as regular tags and place items into subcollections for items already imported (local-API writes)")
-    s.add_argument("spec"); s.add_argument("--dry-run", action="store_true", help="show the changes, write nothing")
+    s.add_argument("spec"); s.add_argument("--dry-run", action="store_true", help="show the changes and their hash, write nothing")
+    s.add_argument("--confirm", metavar="HASH", help="the hash `organize --dry-run` printed")
     s.set_defaults(f=cmd_organize)
     s = sp.add_parser("attach", help="attach a local file to an existing item (--item KEY; 3 approval dialogs) or to a new item made from a DOI/arXiv ID (--new ID; no dialog)")
     s.add_argument("lib"); s.add_argument("file")
