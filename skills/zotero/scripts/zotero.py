@@ -320,6 +320,33 @@ def cmd_selftest(a):
     expect("log: fields", set(recs[0]) == {"ts", "command", "library", "collection", "method", "endpoint", "objects", "sha256", "status"})
     expect("log: count list payload", count_objects("/api/users/0/items", b'[{"key": "A"}, {"key": "B"}]') == 2)
 
+    # UTF-8: umlauts survive a round trip, with or without a BOM; a legacy code page is refused, not mangled
+    with tempfile.TemporaryDirectory() as td:
+        spec_u = {"collection": "JoS SDG7", "entries": [{"claimed": {"title": "Fünf Kategorien: Fröste, Flüsse",
+                                                                     "authors": "Bjerregård, Sørensen, Möhrlen"}}]}
+        p_plain, p_bom, p_1252 = (os.path.join(td, n) for n in ("plain.json", "bom.json", "cp1252.json"))
+        write_json(p_plain, spec_u)
+        with open(p_bom, "wb") as f:
+            f.write(b"\xef\xbb\xbf" + json.dumps(spec_u, ensure_ascii=False).encode("utf-8"))
+        with open(p_1252, "wb") as f:
+            f.write(json.dumps(spec_u, ensure_ascii=False).encode("cp1252"))
+        with open(p_plain, "rb") as f:
+            raw = f.read()
+        expect("utf-8: written as UTF-8", "Bjerregård".encode("utf-8") in raw and not raw.startswith(b"\xef\xbb\xbf"))
+        expect("utf-8: umlauts round trip", read_json(p_plain) == spec_u)
+        expect("utf-8: BOM tolerated", read_json(p_bom) == spec_u)
+        try:
+            read_json(p_1252)
+            expect("utf-8: cp1252 file refused", False)
+        except SystemExit:
+            expect("utf-8: cp1252 file refused", True)
+        p_cfg = os.path.join(td, "config.json")
+        with open(p_cfg, "wb") as f:
+            f.write(b"\xef\xbb\xbf" + CONFIG_EXAMPLE.encode("utf-8"))
+        if os.name == "posix":
+            os.chmod(p_cfg, 0o600)
+        expect("utf-8: allowlist with BOM", load_config(p_cfg)[1] is None)
+
     # note: only child notes, only these fields, at most one dialog's worth
     good = {"parent": "ABCD2345", "note": "<h1>Title</h1><p>x</p>", "tags": ["needs review"]}
     for label, entries, must_block in [("note: valid", [good], False),
@@ -335,6 +362,29 @@ def cmd_selftest(a):
     sys.exit(1 if bad else 0)
 
 
+# ---------------------------------------------------------------- files: UTF-8 always, a BOM tolerated on input
+def read_text(path):
+    """Text of a file as UTF-8; a byte-order mark (Notepad, PowerShell's Set-Content -Encoding utf8) is dropped.
+    Never the platform default encoding, which on Windows is a legacy code page that mangles umlauts."""
+    with open(path, encoding="utf-8-sig") as f:
+        return f.read()
+
+
+def read_json(path, what="file"):
+    try:
+        return json.loads(read_text(path))
+    except UnicodeDecodeError as ex:
+        sys.exit("%s %s is not UTF-8 (%s); save it as UTF-8" % (what, path, ex))
+    except ValueError as ex:
+        sys.exit("%s %s is not valid JSON (%s)" % (what, path, ex))
+
+
+def write_json(path, obj):
+    """UTF-8, no BOM, non-ASCII kept readable."""
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(obj, f, indent=1, ensure_ascii=False)
+
+
 # ---------------------------------------------------------------- write log (metadata only, never item content)
 LOG_CONTEXT = {"command": None, "library": None, "collection": None}  # filled by main() and the write paths
 
@@ -348,7 +398,7 @@ def ensure_log(path=None):
     path = path or log_path()
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        open(path, "a").close()
+        open(path, "a", encoding="utf-8").close()
     except OSError as ex:
         sys.exit("write refused: cannot append to the write log %s (%s)" % (path, ex))
 
@@ -385,8 +435,7 @@ def cmd_log(a):
     if not os.path.isfile(p):
         print("(no writes logged yet)")
         return
-    with open(p, encoding="utf-8") as f:
-        lines = f.readlines()[-a.n:] if a.n > 0 else []
+    lines = read_text(p).splitlines()[-a.n:] if a.n > 0 else []
     for line in lines:
         try:
             r = json.loads(line)
@@ -855,8 +904,9 @@ def load_config(path=None):
     path = path or config_path()
     try:
         st = os.stat(path)
-        with open(path, encoding="utf-8-sig") as f:  # -sig: Notepad and PowerShell may write a BOM
-            text = f.read()
+        text = read_text(path)
+    except UnicodeDecodeError as ex:
+        return None, "%s is not UTF-8 (%s)" % (path, ex)
     except FileNotFoundError:
         return None, "no allowlist file at %s" % path
     except OSError as ex:
@@ -1228,11 +1278,7 @@ def note_objects(lib, entries):
 def cmd_note(a):
     """Add child notes to items already in the library: one local-API request, one approval dialog, bound to
     the hash printed by --dry-run and to the allowlist (every parent must be in an allowlisted collection)."""
-    with open(a.file, encoding="utf-8-sig") as f:
-        try:
-            entries = json.load(f)
-        except ValueError as ex:
-            sys.exit("%s is not valid JSON (%s)" % (a.file, ex))
+    entries = read_json(a.file, "note file")
     err = note_entries_problem(entries)
     if err:
         sys.exit("note refused: " + err)
@@ -1296,7 +1342,7 @@ def load_resolved(spec_arg):
     p = resolved_for(spec_arg)
     if not os.path.isfile(p):
         sys.exit("no verify output for %s (expected %s); run `verify %s` first" % (spec_arg, p, spec_arg))
-    return json.load(open(p))
+    return read_json(p, "verify output")
 
 
 IMPORTABLE = ("ok", "accepted", "unverified")  # verify statuses that import / organize act on
@@ -1319,7 +1365,7 @@ def cmd_where(a):
 
 
 def cmd_verify(a):
-    spec = json.load(open(a.spec))
+    spec = read_json(a.spec, "spec")
     out_path = resolved_for(a.spec, create=True)
     res = {"library": spec["library"], "collection": spec.get("collection"), "tags": spec.get("tags", []),
            "tag_type": spec.get("tag_type", "manual"),
@@ -1359,8 +1405,7 @@ def cmd_verify(a):
                 "unverified": "UNVERIF", "refused": "REFUSED"}[r["status"]]
         print("%-8s %-34s sim=%-4s pdf=%-3s %s | %s" % (flag, ident, r.get("title_sim"), len(r.get("pdf_urls", [])),
               (r.get("item") or {}).get("title", "")[:48], r.get("detail", "")))
-    with open(out_path, "w") as f:
-        json.dump(res, f, indent=1, ensure_ascii=False)
+    write_json(out_path, res)
     n = {k: sum(1 for x in res["entries"] if x["status"] == k) for k in ("ok", "accepted", "unverified", "mismatch", "notfound", "refused")}
     print("\n%s\nwrote %s" % (n, out_path))
 
@@ -1833,6 +1878,11 @@ def main():
     s.set_defaults(f=cmd_note)
     s = sp.add_parser("trash", help="move items to Zotero's trash (one approval dialog)"); s.add_argument("lib"); s.add_argument("keys", nargs="+"); s.set_defaults(f=cmd_trash)
     a = p.parse_args()
+    for stream in (sys.stdout, sys.stderr):  # a title with e.g. U+2212 must not crash output piped to a cp1252 console
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     LOG_CONTEXT["command"] = a.cmd
     global GUARD
     GUARD = LOCAL_ONLY if a.cmd in READ_ONLY_CMDS else REMOTE_READ if a.cmd in VERIFY_CMDS else None
