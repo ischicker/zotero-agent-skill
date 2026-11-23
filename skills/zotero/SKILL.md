@@ -78,7 +78,16 @@ The library is a human's working space; write what a human would write by hand.
 
 ## Adding a note to an item already in Zotero
 
-`import` only creates notes together with a new item. There is currently no command for adding a note to an existing item: the generic `write` command (arbitrary JSON to the local API) was removed because it could change any object in any library. Tell the user and do not work around it with ad-hoc HTTP requests.
+`import` only creates notes together with a new item. For a reference already in the library use `note LIB FILE`, which only creates child notes. FILE is a JSON list (1-50) of:
+
+```json
+[{"parent": "PARENTKEY", "note": "<h1>Title: what and where from (LLM-generated, unreviewed)</h1><p>...</p>", "tags": ["needs review"]}]
+```
+
+- Only `parent`, `note` and `tags` are accepted. The parent must be a regular, non-trashed item (not an attachment or note) in an allowlisted collection (`allowlist`); get its key with `find LIB QUERY`.
+- First `note LIB FILE --dry-run`: shows each note, skips any that resembles a note the parent already has, and prints a hash. Show that to the user; then `note LIB FILE --confirm HASH`. One approval dialog for the whole file.
+- Follow the note conventions under Zotero-native (first line is the title; label LLM text; HTML, so wrap plain prose in `<p>` and escape `<`, `&`; plain text is wrapped for you). Tags come out regular.
+- Check with `notes LIB PARENTKEY`. To remove a mistaken note, `trash LIB NOTEKEY`.
 
 ## Write commands and the modal
 

@@ -17,6 +17,7 @@ Not read-only:
     attach LIB FILE (--item KEY | --new ID)
                        local file -> existing item (local-API upload: 3 approval dialogs) or new item resolved
                        from a DOI/arXiv ID (connector: no dialog), in one call
+    note LIB FILE      child notes on existing items (local-API write: one approval dialog); --dry-run, --confirm
     trash LIB KEY...   local-API write (one approval dialog per request)
 
 Design rule: the model never types bibliographic metadata. It supplies identifiers
@@ -314,6 +315,17 @@ def cmd_selftest(a):
     expect("log: upload key masked", "SECRETUPLOADKEY" not in text)
     expect("log: fields", set(recs[0]) == {"ts", "command", "library", "collection", "method", "endpoint", "objects", "sha256", "status"})
     expect("log: count list payload", count_objects("/api/users/0/items", b'[{"key": "A"}, {"key": "B"}]') == 2)
+
+    # note: only child notes, only these fields, at most one dialog's worth
+    good = {"parent": "ABCD2345", "note": "<h1>Title</h1><p>x</p>", "tags": ["needs review"]}
+    for label, entries, must_block in [("note: valid", [good], False),
+                                       ("note: empty list", [], True),
+                                       ("note: over 50", [good] * 51, True),
+                                       ("note: extra field", [dict(good, collections=["X"])], True),
+                                       ("note: bad parent key", [dict(good, parent="../items")], True),
+                                       ("note: empty text", [dict(good, note="<p> </p>")], True),
+                                       ("note: tags not a list", [dict(good, tags="x")], True)]:
+        check(label, note_entries_problem(entries) is not None, must_block)
     print("read-only commands:", ", ".join(sorted(READ_ONLY_CMDS)))
     print("network-read commands:", ", ".join(sorted(VERIFY_CMDS)))
     sys.exit(1 if bad else 0)
@@ -1157,6 +1169,85 @@ def cmd_attach(a):
         print("created %s and attached %s (%.0f KB) -> %s" % (a.new, os.path.basename(path), len(body) / 1024, t))
 
 
+NOTE_KEYS = {"parent", "note", "tags"}
+
+
+def note_entries_problem(entries):
+    """None if `entries` is a valid `note` file body: a list of 1-50 {parent, note[, tags]}, else why not."""
+    if not isinstance(entries, list) or not 1 <= len(entries) <= 50:
+        return "the file must hold a JSON list of 1 to 50 notes (one approval dialog per run)"
+    for n, e in enumerate(entries):
+        if not isinstance(e, dict) or set(e) - NOTE_KEYS:
+            return "note %d: only the keys %s are allowed" % (n, ", ".join(sorted(NOTE_KEYS)))
+        if not isinstance(e.get("parent"), str) or not re.fullmatch(r"[A-Z0-9]{8}", e["parent"]):
+            return "note %d: parent must be an 8-character Zotero item key" % n
+        if not isinstance(e.get("note"), str) or not clean(e["note"]):
+            return "note %d: note must be non-empty text or HTML" % n
+        if not isinstance(e.get("tags", []), list) or not all(isinstance(t, str) for t in e.get("tags", [])):
+            return "note %d: tags must be a list of strings" % n
+    return None
+
+
+def note_objects(lib, entries):
+    """Plan for `note` (GET only): (child-note objects to create, [(parent, reason)] skipped). Parents must be
+    regular, non-trashed items; a note resembling one the parent already has (note_present) is skipped."""
+    lp = lib_path(lib)
+    objs, skipped, seen = [], [], {}
+    for e in entries:
+        k = e["parent"]
+        try:
+            d = zget(lp + "/items/" + k, include="data")[0]["data"]
+        except urllib.error.HTTPError as ex:
+            sys.exit("No item %s in %s (HTTP %d)" % (k, lib, ex.code))
+        if d.get("itemType") in ("note", "attachment"):
+            sys.exit("%s is a%s %s; notes go on the parent item" % (k, "n" if d["itemType"] == "attachment" else "", d["itemType"]))
+        if d.get("deleted"):
+            sys.exit("%s is in the trash" % k)
+        if k not in seen:
+            kids = zget(lp + "/items/%s/children" % k, itemType="note", include="data")[0]
+            seen[k] = [norm(clean(c["data"].get("note", ""))[:600]) for c in kids]
+        body = note_html(e["note"])
+        if note_present(body, seen[k]):
+            skipped.append((k, "a similar note is already there"))
+            continue
+        seen[k].append(norm(clean(body)[:600]))
+        objs.append({"itemType": "note", "parentItem": k, "note": body, "tags": tag_objs(e.get("tags", []), 0)})
+    return objs, skipped
+
+
+def cmd_note(a):
+    """Add child notes to items already in the library: one local-API request, one approval dialog, bound to
+    the hash printed by --dry-run and to the allowlist (every parent must be in an allowlisted collection)."""
+    with open(a.file, encoding="utf-8") as f:
+        try:
+            entries = json.load(f)
+        except ValueError as ex:
+            sys.exit("%s is not valid JSON (%s)" % (a.file, ex))
+    err = note_entries_problem(entries)
+    if err:
+        sys.exit("note refused: " + err)
+    objs, skipped = note_objects(a.lib, entries)
+    for o in objs:
+        print("  add to %s: %s" % (o["parentItem"], clean(o["note"])[:70]))
+    for k, why in skipped:
+        print("  skip %s: %s" % (k, why))
+    if not objs:
+        print("nothing to add")
+        return
+    h = payload_hash({"library": a.lib, "objects": objs})
+    if a.dry_run:
+        print("note hash (note LIB FILE --confirm): %s" % h)
+        return
+    confirm_or_exit("note", a.confirm, h, "note LIB FILE --dry-run")
+    r = local_write(a.lib, objs)
+    made = r.get("successful") or {}
+    print("added %d notes, failed %d" % (len(made), len(r.get("failed") or {})))
+    for i, v in sorted(made.items(), key=lambda kv: int(kv[0])):
+        print("  note %s on %s" % (v.get("key"), objs[int(i)]["parentItem"]))
+    for k, v in (r.get("failed") or {}).items():
+        print("  failed %s: %s" % (k, v))
+
+
 def cmd_trash(a):
     lp = lib_path(a.lib)
     objs = []
@@ -1725,6 +1816,11 @@ def main():
     s.add_argument("--item", help="key of the existing parent item"); s.add_argument("--new", metavar="ID", help="DOI or arXiv:ID of a new item to create")
     s.add_argument("--coll", help="with --new: collection to put it in (default: library root)"); s.add_argument("--title", help="attachment title (default: Full Text PDF / file name)")
     s.add_argument("--max-mb", type=int, default=50); s.set_defaults(f=cmd_attach)
+    s = sp.add_parser("note", help="add child notes to existing items from a JSON list of {parent, note, tags} (one approval dialog); --dry-run, then --confirm HASH")
+    s.add_argument("lib"); s.add_argument("file")
+    s.add_argument("--dry-run", action="store_true", help="show the notes and their hash, write nothing")
+    s.add_argument("--confirm", metavar="HASH", help="the hash `note --dry-run` printed")
+    s.set_defaults(f=cmd_note)
     s = sp.add_parser("trash", help="move items to Zotero's trash (one approval dialog)"); s.add_argument("lib"); s.add_argument("keys", nargs="+"); s.set_defaults(f=cmd_trash)
     a = p.parse_args()
     LOG_CONTEXT["command"] = a.cmd
