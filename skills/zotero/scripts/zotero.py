@@ -74,7 +74,7 @@ SIM_OK = 0.85
 GUARD = None
 LOCAL_ONLY = (HOST + "/",)
 REMOTE_READ = LOCAL_ONLY + ("https://api.crossref.org/", "https://export.arxiv.org/", "https://api.openalex.org/")
-READ_ONLY_CMDS = {"status", "libs", "colls", "ls", "find", "notes", "path", "plan", "where", "selftest"}  # GUARD = LOCAL_ONLY
+READ_ONLY_CMDS = {"status", "libs", "colls", "ls", "find", "notes", "path", "plan", "where", "selftest", "allowlist"}  # GUARD = LOCAL_ONLY
 VERIFY_CMDS = {"verify"}                                                                  # GUARD = REMOTE_READ
 
 
@@ -150,10 +150,73 @@ def cmd_selftest(a):
              ("host: no port", "http://127.0.0.1", True),
              ("host: path", "http://127.0.0.1:23119/x", True),
              ("host: short form 127.1", "http://127.1:23119", True)]
-    for label, value, must_block in hosts:
-        blocked = host_problem(value) is not None
+    def check(label, blocked, must_block):
+        nonlocal bad
         bad += blocked != must_block
         print("%-30s %s %s" % (label, "BLOCKED" if blocked else "allowed", "ok" if blocked == must_block else "FAIL"))
+    for label, value, must_block in hosts:
+        check(label, host_problem(value) is not None, must_block)
+
+    # write allowlist: a missing or malformed file allows nothing
+    with tempfile.TemporaryDirectory() as td:
+        check("allowlist: no file", load_config(os.path.join(td, "config.json"))[1] is not None, True)
+    for label, text, must_block in [
+            ("allowlist: example", CONFIG_EXAMPLE, False),
+            ("allowlist: not JSON", "{", True),
+            ("allowlist: library root", '{"write_targets": [{"library": "My Library"}]}', True),
+            ("allowlist: empty collection", '{"write_targets": [{"library": "My Library", "collection": " "}]}', True),
+            ("allowlist: unknown key", '{"write_targets": [], "allow_all": true}', True),
+            ("allowlist: subcolls not bool", '{"write_targets": [{"library": "L", "collection": "C", "subcollections": "yes"}]}', True)]:
+        check(label, parse_config(text)[1] is not None, must_block)
+    # objects against an allowlisted tree {SKT, SUB}; state: item -> (own collections, effective collections)
+    allowed = {"SKT", "SUB"}
+    state = {"IN": ({"SKT"}, {"SKT"}), "OUT": ({"OTHER"}, {"OTHER"}), "BOTH": ({"SKT", "OTHER"}, {"SKT", "OTHER"}),
+             "NOTE": (set(), {"SKT"})}
+    for label, kind, objs, parents_ok, must_block in [
+            ("scope: tags on item in tree", "items", [{"key": "IN", "version": 1, "tags": []}], allowed, False),
+            ("scope: edit child note in tree", "items", [{"key": "NOTE", "version": 1, "note": "x"}], allowed, False),
+            ("scope: trash item outside", "items", [{"key": "OUT", "version": 1, "deleted": 1}], allowed, True),
+            ("scope: unknown item key", "items", [{"key": "NOPE", "version": 1, "deleted": 1}], allowed, True),
+            ("scope: move within tree", "items", [{"key": "IN", "version": 1, "collections": ["SUB"]}], allowed, False),
+            ("scope: keep outside membership", "items", [{"key": "BOTH", "version": 1, "collections": ["OTHER", "SUB"]}], allowed, False),
+            ("scope: add outside collection", "items", [{"key": "IN", "version": 1, "collections": ["SKT", "OTHER"]}], allowed, True),
+            ("scope: drop outside membership", "items", [{"key": "BOTH", "version": 1, "collections": ["SKT"]}], allowed, True),
+            ("scope: new note, parent in", "items", [{"itemType": "note", "parentItem": "IN", "note": "x"}], allowed, False),
+            ("scope: new note, parent out", "items", [{"itemType": "note", "parentItem": "OUT", "note": "x"}], allowed, True),
+            ("scope: new item outside", "items", [{"itemType": "book", "collections": ["OTHER"]}], allowed, True),
+            ("scope: new item, no collection", "items", [{"itemType": "book"}], allowed, True),
+            ("scope: one bad in batch", "items", [{"key": "IN", "version": 1, "tags": []}, {"key": "OUT", "version": 1, "deleted": 1}], allowed, True),
+            ("scope: new subcollection", "collections", [{"name": "Block 1", "parentCollection": "SKT"}], allowed, False),
+            ("scope: subcoll, not permitted", "collections", [{"name": "Block 1", "parentCollection": "SKT"}], set(), True),
+            ("scope: subcoll outside", "collections", [{"name": "X", "parentCollection": "OTHER"}], allowed, True),
+            ("scope: rename collection", "collections", [{"key": "SKT", "version": 1, "name": "X"}], allowed, True)]:
+        check(label, bool(scope_violations(kind, objs, allowed, parents_ok, state)), must_block)
+    # backstop in http(): a non-GET request must be covered by an allowlist check made earlier in the run
+    saved_libs, saved_scope = set(AUTHORIZED_LIBS), dict(CONNECTOR_SCOPE)
+    sess = lambda s, **kw: json.dumps(dict(sessionID=s, **kw)).encode()
+    try:
+        AUTHORIZED_LIBS.clear(); CONNECTOR_SCOPE.clear()
+        cases = [("backstop: unchecked local write", (h + "/api/users/0/items", b"[]", "POST", None), True),
+                 ("backstop: unchecked authorize", (h + "/api/local/authorize", b"{}", "POST", None), True),
+                 ("backstop: unchecked saveItems", (h + "/connector/saveItems", sess("S"), "POST", None), True),
+                 ("backstop: connector read", (h + "/connector/getSelectedCollection", b"{}", "POST", None), False),
+                 ("backstop: POST off loopback", ("https://example.org/x", b"{}", "POST", None), True)]
+        for label, args, must_block in cases:
+            check(label, write_violation(*args) is not None, must_block)
+        AUTHORIZED_LIBS.add("/users/0"); CONNECTOR_SCOPE.update(session="S", target="C1")
+        cases = [("backstop: checked library", (h + "/api/users/0/items", b"[]", "POST", None), False),
+                 ("backstop: other library", (h + "/api/groups/5/items", b"[]", "POST", None), True),
+                 ("backstop: saveItems, session", (h + "/connector/saveItems", sess("S"), "POST", None), False),
+                 ("backstop: saveItems, other sess", (h + "/connector/saveItems", sess("X"), "POST", None), True),
+                 ("backstop: updateSession target", (h + "/connector/updateSession", sess("S", target="C1"), "POST", None), False),
+                 ("backstop: updateSession other", (h + "/connector/updateSession", sess("S", target="C9"), "POST", None), True),
+                 ("backstop: saveAttachment", (h + "/connector/saveAttachment", b"%PDF-", "POST", {"X-Metadata": sess("S").decode()}), False),
+                 ("backstop: other connector call", (h + "/connector/saveSnapshot", sess("S"), "POST", None), True)]
+        for label, args, must_block in cases:
+            check(label, write_violation(*args) is not None, must_block)
+    finally:
+        AUTHORIZED_LIBS.clear(); AUTHORIZED_LIBS.update(saved_libs)
+        CONNECTOR_SCOPE.clear(); CONNECTOR_SCOPE.update(saved_scope)
     print("read-only commands:", ", ".join(sorted(READ_ONLY_CMDS)))
     print("network-read commands:", ", ".join(sorted(VERIFY_CMDS)))
     sys.exit(1 if bad else 0)
@@ -164,6 +227,9 @@ def http(url, data=None, headers=None, method=None, timeout=60, raw=False):
         err = read_only_violation(url, data, method, GUARD)
         if err:
             sys.exit(err)
+    err = write_violation(url, data, method, headers)
+    if err:
+        sys.exit("write refused: " + err)
     h = dict(UA)
     h.update(headers or {})
     req = urllib.request.Request(url, data=data, headers=h, method=method)
@@ -207,13 +273,18 @@ def groups():
     return {g["data"]["name"]: g["id"] for g in out}
 
 
-def lib_path(name):
+def lib_path_or_none(name):
     if name.lower() in ("my library", "user", "me", "0"):
         return "/users/0"
     g = {n.lower(): i for n, i in groups().items()}
-    if name.lower() not in g:
+    return "/groups/%s" % g[name.lower()] if name.lower() in g else None
+
+
+def lib_path(name):
+    lp = lib_path_or_none(name)
+    if lp is None:
         sys.exit("No library %r. Available: My Library, %s" % (name, ", ".join(sorted(groups()))))
-    return "/groups/%s" % g[name.lower()]
+    return lp
 
 
 def all_collections(lp):
@@ -524,6 +595,229 @@ def library_tags(lp):
             return names
 
 
+# ---------------------------------------------------------------- write allowlist (user-owned file, outside the repo)
+# Every write is checked twice: local_write() and connector_scope() compare the target with the allowlist, and
+# http() refuses any non-GET request that no such check covered (write_violation). No file, no writes.
+APP_DIR = "zotero-skill"
+CONFIG_KEYS = {"write_targets", "_comment"}
+CONFIG_EXAMPLE = '{"write_targets": [{"library": "My Library", "collection": "Skill-Test", "subcollections": true}]}'
+AUTHORIZED_LIBS = set()   # library paths ("/users/0") whose write targets local_write() checked in this run
+CONNECTOR_SCOPE = {}      # {"session", "target"} once connector_scope() checked the target in this run
+CONNECTOR_READS = ("getSelectedCollection", "ping")  # connector POSTs that read only
+
+
+def user_dir(kind):
+    """Per-user directory under the home directory. kind 'config' holds the allowlist, 'state' the write log.
+    Deliberately not read from APPDATA / XDG_* variables, so a command-line prefix cannot swap in another file."""
+    home = os.path.expanduser("~")
+    if sys.platform == "win32":
+        sub = ("AppData", "Roaming") if kind == "config" else ("AppData", "Local")
+    elif sys.platform == "darwin":
+        sub = ("Library", "Application Support") if kind == "config" else ("Library", "Logs")
+    else:
+        sub = (".config",) if kind == "config" else (".local", "state")
+    return os.path.join(home, *sub, APP_DIR)
+
+
+def config_path():
+    return os.path.join(user_dir("config"), "config.json")
+
+
+def parse_config(text):
+    """(config, None) or (None, reason). Anything unexpected is an error: the caller then allows nothing."""
+    try:
+        c = json.loads(text)
+    except ValueError as ex:
+        return None, "not valid JSON (%s)" % ex
+    if not isinstance(c, dict) or set(c) - CONFIG_KEYS:
+        return None, "the top level must be an object with only these keys: %s" % ", ".join(sorted(CONFIG_KEYS))
+    targets = c.get("write_targets", [])
+    if not isinstance(targets, list):
+        return None, "write_targets must be a list"
+    for t in targets:
+        if (not isinstance(t, dict) or set(t) - {"library", "collection", "subcollections"}
+                or not all(isinstance(t.get(k), str) and t[k].strip() for k in ("library", "collection"))
+                or not isinstance(t.get("subcollections", False), bool)):
+            return None, ("each write_targets entry needs non-empty strings library and collection, and optionally "
+                          "subcollections: true/false; got %s" % json.dumps(t))
+    c["write_targets"] = targets
+    return c, None
+
+
+def load_config(path=None):
+    """(allowlist, None), or (None, reason) when there is none; every write path then refuses."""
+    path = path or config_path()
+    try:
+        st = os.stat(path)
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        return None, "no allowlist file at %s" % path
+    except OSError as ex:
+        return None, "cannot read %s (%s)" % (path, ex)
+    if os.name == "posix" and (st.st_mode & 0o022 or st.st_uid != os.getuid()):
+        return None, "%s must be owned by you and not writable by group or others" % path
+    return parse_config(text)
+
+
+def need_config():
+    c, err = load_config()
+    if err:
+        sys.exit("write refused: %s.\nOnly the user (never the agent) creates or edits that file. Example content:\n  %s"
+                 % (err, CONFIG_EXAMPLE))
+    return c
+
+
+def allowed_keys(lib):
+    """(lib path, allowed, parents_ok) for library LIB: the collection keys writes may touch, and the keys under
+    which new subcollections may be created (only targets with "subcollections": true). Exits if LIB has none."""
+    c = need_config()
+    lp = lib_path(lib)
+    targets = [t for t in c["write_targets"] if lib_path_or_none(t["library"]) == lp]
+    colls = all_collections(lp) if targets else []
+    by_name, children = {}, {}
+    for co in colls:
+        by_name.setdefault(co["data"]["name"].lower(), []).append(co["key"])
+        children.setdefault(co["data"].get("parentCollection") or None, []).append(co["key"])
+    allowed, parents_ok = set(), set()
+    for t in targets:
+        keys = by_name.get(t["collection"].lower(), [])
+        if len(keys) != 1:
+            print("warning: allowlisted collection %r in %r: %d matches, ignored" % (t["collection"], t["library"], len(keys)),
+                  file=sys.stderr)
+            continue
+        tree, stack = {keys[0]}, [keys[0]]
+        while t.get("subcollections") and stack:
+            for ch in children.get(stack.pop(), []):
+                if ch not in tree:
+                    tree.add(ch)
+                    stack.append(ch)
+        allowed |= tree
+        if t.get("subcollections"):
+            parents_ok |= tree
+    if not allowed:
+        sys.exit("write refused: no collection of library %r is in the allowlist %s" % (lib, config_path()))
+    return lp, allowed, parents_ok
+
+
+def item_state(lp, keys):
+    """{key: (own collections, effective collections)}; a child item's effective collections are its parent's.
+    Keys that do not resolve are left out, which scope_violations() treats as outside the allowlist."""
+    out = {}
+    for k in sorted(keys):
+        try:
+            d = zget(lp + "/items/" + k, include="data")[0]["data"]
+            own = set(d.get("collections", []))
+            eff = set(zget(lp + "/items/" + d["parentItem"], include="data")[0]["data"].get("collections", [])) \
+                if d.get("parentItem") else own
+        except urllib.error.HTTPError:
+            continue
+        out[k] = (own, eff)
+    return out
+
+
+def scope_violations(kind, objs, allowed, parents_ok, state):
+    """Why the local-API objects would reach outside the allowlist (empty list: they do not).
+    Existing items must be in an allowed collection (children: via their parent); collection memberships may only
+    be added or removed inside the allowed set; new items need an allowed parent or allowed collections only;
+    new collections need a parent in parents_ok; existing collections are never changed."""
+    errs = []
+    for n, o in enumerate(objs):
+        what = "object %d%s" % (n, " (%s)" % o["key"] if o.get("key") else "")
+        if kind == "collections":
+            if o.get("key"):
+                errs.append(what + ": changing an existing collection is not allowed")
+            elif o.get("parentCollection") not in parents_ok:
+                errs.append(what + ": new collection %r would be outside the allowlisted tree" % o.get("name"))
+            continue
+        if kind != "items":
+            errs.append(what + ": unsupported object kind %r" % kind)
+            continue
+        if o.get("key"):
+            own, eff = state.get(o["key"], (set(), set()))
+            if not eff & allowed:
+                errs.append(what + ": the item is not in an allowlisted collection")
+            if "collections" in o and (set(o["collections"]) ^ own) - allowed:
+                errs.append(what + ": would add or remove collections outside the allowlist: %s"
+                            % sorted((set(o["collections"]) ^ own) - allowed))
+        elif not o.get("parentItem") and (not o.get("collections") or set(o["collections"]) - allowed):
+            errs.append(what + ": a new top-level item must go into allowlisted collections only")
+        if o.get("parentItem") and not state.get(o["parentItem"], (set(), set()))[1] & allowed:
+            errs.append(what + ": parent item %s is not in an allowlisted collection" % o["parentItem"])
+    return errs
+
+
+def write_violation(url, data, method, headers=None):
+    """Backstop in http() under every write path: None if this request is a GET or is covered by an allowlist
+    check made earlier in this run (local_write / connector_scope), else the reason it is refused."""
+    verb = method or ("POST" if data is not None else "GET")
+    if verb == "GET":
+        return None
+    if not url.startswith(HOST + "/"):
+        return "%s %s refused: writes only go to Zotero on loopback" % (verb, url)
+    path = urllib.parse.urlsplit(url).path
+    if path.startswith("/connector/"):
+        ep = path[len("/connector/"):]
+        if ep in CONNECTOR_READS:
+            return None
+        if ep not in ("saveItems", "updateSession", "saveAttachment"):
+            return "connector %s refused: not an endpoint this skill writes through" % ep
+        if not CONNECTOR_SCOPE:
+            return "connector %s refused: no allowlisted target was checked first" % ep
+        try:
+            meta = json.loads((headers or {}).get("X-Metadata") or data or b"{}")
+        except ValueError:
+            meta = None
+        if not isinstance(meta, dict) or meta.get("sessionID") != CONNECTOR_SCOPE["session"]:
+            return "connector %s refused: not the session opened for the allowlisted target" % ep
+        if ep == "updateSession" and meta.get("target") != CONNECTOR_SCOPE["target"]:
+            return "connector updateSession refused: target %r is not the allowlisted %r" % (meta.get("target"), CONNECTOR_SCOPE["target"])
+        return None
+    if path == "/api/local/authorize" or path.startswith("/api/local/uploads/"):
+        return None if AUTHORIZED_LIBS else "%s %s refused: no allowlist check was made first" % (verb, path)
+    m = re.match(r"/api(/users/0|/groups/\d+)/", path)
+    if not m or m.group(1) not in AUTHORIZED_LIBS:
+        return "%s %s refused: that library was not checked against the allowlist" % (verb, path)
+    return None
+
+
+def connector_scope(library, collection):
+    """Check an import/attach target against the allowlist, then map it to the connector's target id and open the
+    one session the connector writes of this run are bound to. Returns (target id, target name, session id)."""
+    if not collection:
+        sys.exit("write refused: the library root is never a write target; name an allowlisted collection")
+    lp, allowed, _ = allowed_keys(library)
+    if collection_key(lp, collection) not in allowed:
+        sys.exit("write refused: %s / %s is not in the allowlist %s" % (library, collection, config_path()))
+    target, tname = connector_target(library, collection)
+    CONNECTOR_SCOPE.update(session="zskill-%d" % int(time.time()), target=target)
+    return target, tname, CONNECTOR_SCOPE["session"]
+
+
+def cmd_allowlist(a):
+    """Read-only: print the allowlist file, what it permits and, if Zotero is running, the collection keys."""
+    print("allowlist file:", config_path())
+    c, err = load_config()
+    if err:
+        print("NO WRITES ALLOWED: %s\nexample content (the user creates the file):\n  %s" % (err, CONFIG_EXAMPLE))
+        return
+    if not c["write_targets"]:
+        print("write_targets: none, so no writes are allowed")
+    for t in c["write_targets"]:
+        print("write target: %s / %s  %s" % (t["library"], t["collection"],
+              "(and its subcollections)" if t.get("subcollections") else "(this collection only)"))
+    try:
+        require_zotero10()
+    except SystemExit:
+        print("(Zotero is not running: collection keys not resolved)")
+        return
+    for t in c["write_targets"]:
+        lp = lib_path_or_none(t["library"])
+        keys = [co["key"] for co in all_collections(lp) if co["data"]["name"].lower() == t["collection"].lower()] if lp else []
+        print("  %s / %s -> %s" % (t["library"], t["collection"],
+              "no such library" if not lp else keys[0] if len(keys) == 1 else "%d matches: ignored" % len(keys)))
+
+
 def local_authorize():
     """Ask the user to approve ONE write request. Returns the headers for it (the key is single-use)."""
     _, hdr = http(HOST + "/api/", headers={"Zotero-API-Version": "3"}, raw=True)
@@ -538,8 +832,14 @@ def local_write(lib, items, kind="items"):
     """Batch-write objects ([{key, version, ...fields}]) to /items (or /collections) via the local API.
 
     Zotero asks the user to approve every write request (the key from /api/local/authorize is
-    single-use), so always send ONE request holding as many objects as possible (max 50)."""
-    lp = lib_path(lib)
+    single-use), so always send ONE request holding as many objects as possible (max 50).
+    Refuses (before any dialog) unless every object stays inside the allowlist: scope_violations()."""
+    lp, allowed, parents_ok = allowed_keys(lib)
+    refs = {o[f] for o in items for f in ("key", "parentItem") if o.get(f)} if kind == "items" else set()
+    errs = scope_violations(kind, items, allowed, parents_ok, item_state(lp, refs))
+    if errs:
+        sys.exit("write refused by the allowlist %s:\n  %s" % (config_path(), "\n  ".join(errs)))
+    AUTHORIZED_LIBS.add(lp)
     h = local_authorize()
     h["Content-Type"] = "application/json"
     out = http(HOST + "/api" + lp + "/" + kind, data=json.dumps(items).encode(), method="POST", headers=h)
@@ -628,8 +928,7 @@ def attach_new(lib, coll, ident, path, body, ctype, title):
     for v in (item.get("DOI", "").lower(), ident.lower()):
         if v and v in ids:
             sys.exit("%s is already in %s (`find %s \"%s\"` for its key); use --item KEY to attach the file to it" % (ident, lib, lib, v))
-    target, tname = connector_target(lib, coll)
-    session = "zskill-%d" % int(time.time())
+    target, tname, session = connector_scope(lib, coll)
     item = dict(item, id="i1", tags=[], notes=[], attachments=[])
     print("new item: %s | %s" % ((item.get("title") or "")[:70], "; ".join(c.get("lastName", "") for c in item.get("creators", [])[:3])))
     connector("saveItems", {"sessionID": session, "uri": "http://localhost/zotero-skill", "items": [item]})
@@ -992,12 +1291,11 @@ def cmd_plan(a):
 def cmd_import(a):
     spec = load_resolved(a.spec)
     b = build_import(spec, a.allow_unverified)
-    target, tname = connector_target(spec["library"], spec.get("collection"))
+    target, tname, session = connector_scope(spec["library"], spec.get("collection"))
     describe(spec, b)
     items, entries = b["items"], b["entries"]
     if not items:
         return
-    session = "zskill-%d" % int(time.time())
     connector("saveItems", {"sessionID": session, "uri": "http://localhost/zotero-skill", "items": items})
     connector("updateSession", {"sessionID": session, "target": target, "tags": ""})
     got = 0
@@ -1041,6 +1339,7 @@ def main():
     sp.add_parser("status").set_defaults(f=cmd_status)
     sp.add_parser("selftest", help="verify the read-only guard (needs no Zotero)").set_defaults(f=cmd_selftest)
     sp.add_parser("libs").set_defaults(f=cmd_libs)
+    sp.add_parser("allowlist", help="print the write allowlist (user-owned file) and what it permits").set_defaults(f=cmd_allowlist)
     s = sp.add_parser("where", help="print the directory for verify output (and its files), or the output path for SPEC")
     s.add_argument("spec", nargs="?"); s.set_defaults(f=cmd_where)
     s = sp.add_parser("colls"); s.add_argument("lib"); s.set_defaults(f=cmd_colls)
@@ -1072,7 +1371,7 @@ def main():
     a = p.parse_args()
     global GUARD
     GUARD = LOCAL_ONLY if a.cmd in READ_ONLY_CMDS else REMOTE_READ if a.cmd in VERIFY_CMDS else None
-    if a.cmd in ("selftest", "where"):  # need no Zotero
+    if a.cmd in ("selftest", "where", "allowlist"):  # need no Zotero (allowlist uses it if it is running)
         return a.f(a)
     require_zotero10()
     a.f(a)
