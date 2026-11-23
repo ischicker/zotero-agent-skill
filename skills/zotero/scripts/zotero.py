@@ -181,6 +181,10 @@ def cmd_selftest(a):
             ("scope: tags on item in tree", "items", [{"key": "IN", "version": 1, "tags": []}], allowed, False),
             ("scope: edit child note in tree", "items", [{"key": "NOTE", "version": 1, "note": "x"}], allowed, False),
             ("scope: trash item outside", "items", [{"key": "OUT", "version": 1, "deleted": 1}], allowed, True),
+            ("scope: trash item in tree", "items", [{"key": "IN", "version": 1, "deleted": 1}], allowed, False),
+            ("scope: trash item also outside", "items", [{"key": "BOTH", "version": 1, "deleted": 1}], allowed, True),
+            ("scope: trash note, parent in", "items", [{"key": "NOTE", "version": 1, "deleted": 1}], allowed, False),
+            ("scope: tags on item also out", "items", [{"key": "BOTH", "version": 1, "tags": []}], allowed, False),
             ("scope: unknown item key", "items", [{"key": "NOPE", "version": 1, "deleted": 1}], allowed, True),
             ("scope: move within tree", "items", [{"key": "IN", "version": 1, "collections": ["SUB"]}], allowed, False),
             ("scope: keep outside membership", "items", [{"key": "BOTH", "version": 1, "collections": ["OTHER", "SUB"]}], allowed, False),
@@ -1037,12 +1041,13 @@ def item_state(lp, keys):
     return out
 
 
-def scope_violations(kind, objs, allowed, parents_ok, state):
+def scope_violations(kind, objs, allowed, parents_ok, state, names=None):
     """Why the local-API objects would reach outside the allowlist (empty list: they do not).
     Existing items must be in an allowed collection (children: via their parent); collection memberships may only
     be added or removed inside the allowed set; new items need an allowed parent or allowed collections only;
-    new collections need a parent in parents_ok; existing collections are never changed."""
-    errs = []
+    new collections need a parent in parents_ok; existing collections are never changed; an item is only trashed
+    when every collection it is in is allowlisted. NAMES maps collection keys to names for the messages."""
+    errs, names = [], names or {}
     for n, o in enumerate(objs):
         what = "object %d%s" % (n, " (%s)" % o["key"] if o.get("key") else "")
         if kind == "collections":
@@ -1058,6 +1063,10 @@ def scope_violations(kind, objs, allowed, parents_ok, state):
             own, eff = state.get(o["key"], (set(), set()))
             if not eff & allowed:
                 errs.append(what + ": the item is not in an allowlisted collection")
+            elif o.get("deleted") and eff - allowed:
+                # trashing removes the item from every collection, so all of them must be allowlisted
+                errs.append(what + ": trash refused, the item is also in collections outside the allowlist: %s"
+                            % ", ".join(repr(names.get(k, k)) for k in sorted(eff - allowed)))
             if "collections" in o and (set(o["collections"]) ^ own) - allowed:
                 errs.append(what + ": would add or remove collections outside the allowlist: %s"
                             % sorted((set(o["collections"]) ^ own) - allowed))
@@ -1173,7 +1182,8 @@ def local_write(lib, items, kind="items"):
     Refuses (before any dialog) unless every object stays inside the allowlist: scope_violations()."""
     lp, allowed, parents_ok = allowed_keys(lib)
     refs = {o[f] for o in items for f in ("key", "parentItem") if o.get(f)} if kind == "items" else set()
-    errs = scope_violations(kind, items, allowed, parents_ok, item_state(lp, refs))
+    names = {c["key"]: c["data"]["name"] for c in all_collections(lp)}
+    errs = scope_violations(kind, items, allowed, parents_ok, item_state(lp, refs), names)
     if errs:
         sys.exit("write refused by the allowlist %s:\n  %s" % (config_path(), "\n  ".join(errs)))
     AUTHORIZED_LIBS.add(lp)
