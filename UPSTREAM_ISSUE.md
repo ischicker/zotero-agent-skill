@@ -1,28 +1,57 @@
 # Draft issue for glass-bead-labs/zotero-agent-skill
 
-**Title:** Licence question, and an offer of hardening changes as PRs
+**Title:** "Always Allow" in Zotero 10's write dialog creates a permanent key; plus a licence question and hardening PRs
 
 ---
 
 Hi Dav,
 
-thank you for zotero-agent-skill. The README's reasoning (skill + one auditable CLI instead of an MCP server, verify before import, regular tags, subcollections, human-first notes) convinced me to use it for literature screening with a local Zotero 10 library.
+thank you for zotero-agent-skill. The README's reasoning (a skill plus one CLI you can audit instead of an MCP server, verify before import, regular tags, subcollections, notes written for humans) convinced me to use it for literature screening with a local Zotero 10 library. Three things, most important first.
 
-**Licence.** The repository has no LICENSE file, so by default nobody else may reuse or redistribute the code. Which licence do you intend it to be under? I have not added one to my fork, since that is your decision.
+## 1. "Always Allow" should never be recommended
 
-**Hardening changes.** Before using it I made a few changes to the write side, on a branch in my fork, one commit each. They keep the structure (stdlib only, one CLI file, SKILL.md as the agent's instructions), and `selftest` covers each of them without Zotero. I would be glad to open them as separate PRs if you are interested, or to drop any you would rather not have:
+Zotero's local-API approval dialog has three buttons: Allow, Always Allow and Deny. Zotero 10's `chrome/content/zotero/xpcom/server/server_localAPI.js` shows what the middle one does:
 
-1. **Loopback-only `ZOTERO_HOST`.** The read-only guard trusts every URL under `HOST`, which comes from the environment. The script now refuses to start unless it is `http://` + `127.0.0.1` / `[::1]` / `localhost` + port, and rewrites `localhost` to `127.0.0.1`.
-2. **Remove the generic `write` command.** Arbitrary JSON to the local API cannot be bounded by any later check. `local_write()` stays for `organize`, `trash` and `attach`. A narrow `note LIB FILE` (child notes only: `parent`, `note`, `tags`; dedupes) replaces the note use case.
-3. **Write allowlist.** A user-owned JSON file outside the repo lists the collections writes may touch, and every write path fails closed without it. It is enforced in `local_write()` (per object, before the dialog), in a connector-target check, and in a backstop in `http()` that refuses any non-GET request no check covered. New read-only command `allowlist`.
-4. **Plan hash.** `plan` prints a SHA-256 over a canonical serialisation of exactly what `import` would send. `import` requires `--confirm HASH` and refuses on a mismatch. The same goes for `organize --dry-run` / `--confirm` and for `note`.
-5. **PDFs opt-in.** `import --pdf` fetches https only (redirects re-checked; no private or loopback hosts), reads only up to the cap, and still requires `%PDF-`. The spec's `pdf` URL needs `--allow-spec-pdf`. `attach` only reads files inside directories listed in the allowlist file, compared after resolving symlinks.
-6. **Write log.** One JSON line per write request (time, command, library, collection, endpoint, object count, payload SHA-256, HTTP status), no content. New read-only command `log`.
-7. **Docs.** SKILL.md, read-only-safety.md and gotchas.md match the code. SKILL.md now tells the agent to recommend "Allow", never "Always Allow": per `server_localAPI.js`, "Always Allow" stores a never-expiring key in plain text in `localAPIKeys.json`. The script warns if Zotero reports such a key.
+- `addLocalAPIKey(appName, remember)` stores the key with `remember: true` in `localAPIKeys.json` in the Zotero profile directory, in plain text.
+- `consumeLocalAPIKey()` deletes single-use keys on first use, but returns remembered keys without deleting them. Such a key never expires.
+- Any program that reads that file can then write to the library without a dialog.
 
-The branch is at: <FORK URL>, branch `hardening`.
+The skill asks for a fresh key per request anyway, so "Always Allow" gains it nothing and costs the user the review gate. I suggest SKILL.md tell the agent to recommend "Allow", never "Always Allow". I'd also suggest `local_authorize()` warn when the response has `"remember": true`, saying how to revoke the key: quit Zotero, remove those entries from `localAPIKeys.json`, restart. My fork does both.
 
-Things I could not settle, in case you have views: the connector's `saveItems` first saves into the collection selected in the Zotero window, before `updateSession` moves the items, and I found no way to avoid that. Also, the allowlist file cannot be protected from a process running with the user's own permissions.
+## 2. Licence
+
+The repository has no LICENSE file, so by default nobody else may reuse or redistribute the code. Which licence do you intend it to be under? I have not added one to my fork, since that is your decision.
+
+## 3. Hardening changes, offered as PRs
+
+Each change is one commit on branch `hardening` in my fork (<FORK URL>). They keep the structure: stdlib only, one CLI file, SKILL.md as the agent's instructions. Each is covered by `selftest` without Zotero, and the write paths were also exercised end to end against a stub of the local API. Take any subset; I'd open them as separate PRs in this order.
+
+**Bug fixes (small, independent):**
+
+| PR | Commit(s) | What |
+| --- | --- | --- |
+| A | `b0f784b` | `ZOTERO_HOST` must be loopback `http://` with a port (no userinfo, no path); `localhost` becomes `127.0.0.1`. The read guard trusts everything under `HOST`, so a remote value widened it. |
+| B | `f4a2550`, BOM part of `d0188ad` | Every file is read and written as UTF-8, with a BOM tolerated on input. `json.load(open(spec))` used the Windows code page and mangled umlauts and Nordic letters on their way into Zotero. stdout uses `errors="replace"`. |
+
+`d0188ad` also contains an unrelated one-line output change for `plan`, so PR B needs a split cherry-pick. I kept the history as it is.
+
+**Design changes (each builds on the previous ones):**
+
+| PR | Commit(s) | What |
+| --- | --- | --- |
+| C | `0b886d6`, `ad98a25` | Remove the generic `write` command (arbitrary JSON to the local API). Add a narrow `note LIB FILE` instead: child notes only, with dedupe. |
+| D | `f33ae35`, `e54b9ce` | Write allowlist in a user-owned file outside the repo; fails closed. It is checked per object in `local_write()` and per target for the connector, with a backstop in `http()` that refuses any write no check covered. `trash` refuses items that are also in a non-allowlisted collection. |
+| E | `422b564`, `568360c` | Plan hash. `plan` prints a SHA-256 of exactly what `import` would send, including the allowlist file's fingerprint; `import --confirm HASH` refuses on a mismatch. The same applies to `organize` and `note`. Dry runs print library, collection and allowlist. |
+| F | `03d3314` | Selected-collection preflight. `saveItems` saves into the row selected in the Zotero window (`getSaveTarget()` in `server_connector.js`) before `updateSession` moves the items. `import` and `attach --new` now refuse unless `getSelectedCollection` reports an allowlisted collection, checked again right before every `saveItems`. |
+| G | `0ddb02c` | PDFs off by default (`--pdf`): https only, redirects re-checked, download stopped at the cap. The spec `pdf` URL needs `--allow-spec-pdf`. `attach` only reads files from directories listed in the allowlist file. |
+| H | `97b5668` | Write log: one JSON line per write request (metadata and payload SHA-256, no content), plus a `log` command. |
+| I | `1d34ae9` | `resolve`: candidate DOIs/arXiv IDs for entries with `claimed` but no `id`, from Crossref `query.bibliographic` and arXiv. It runs under verify's guard and writes a proposal file without editing a spec. |
+| J | `080447e`, `dcd9fbc` plus later doc edits | Docs: SKILL.md, read-only-safety.md and gotchas.md match the code. The README gets a "Based on" section (only relevant to the fork). |
+
+## Open points I could not settle
+
+- A selection change in Zotero in the moment between the preflight and `saveItems` cannot be caught from outside Zotero.
+- The allowlist file can't be protected from a process running with the user's own permissions. In Claude Code, deny rules on `Read`/`Edit` stop the file tools and shell commands that name the file, but not a script that opens it, and the OS sandbox is not available on native Windows.
 
 Best,
 Irene Schicker

@@ -11,6 +11,8 @@ Read-only (GET to Zotero on loopback only; enforced at runtime, see GUARD and ca
 Network read, one local file (GET only, to Zotero + Crossref/arXiv/OpenAlex; enforced at runtime, see GUARD):
     verify SPEC        resolves identifiers; writes one output file (location: resolved_for()); never touches
                        Zotero. plan/import/organize take the same SPEC; `where SPEC` prints the location.
+    resolve FILE       candidate DOIs/arXiv IDs (Crossref, arXiv) for entries with `claimed` but no `id`; writes a
+                       proposal file next to the verify outputs and never edits a spec. Sends titles and an author.
 Not read-only (each write is checked against the user's allowlist file and logged; see `allowlist`, `log`):
     import SPEC --confirm HASH
                        writes items/notes (PDFs only with --pdf) through the connector (no dialog), then runs
