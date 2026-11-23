@@ -80,7 +80,7 @@ GUARD = None
 LOCAL_ONLY = (HOST + "/",)
 REMOTE_READ = LOCAL_ONLY + ("https://api.crossref.org/", "https://export.arxiv.org/", "https://api.openalex.org/")
 READ_ONLY_CMDS = {"status", "libs", "colls", "ls", "find", "notes", "path", "plan", "where", "selftest", "allowlist", "log"}  # GUARD = LOCAL_ONLY
-VERIFY_CMDS = {"verify"}                                                                  # GUARD = REMOTE_READ
+VERIFY_CMDS = {"verify", "resolve"}                                                       # GUARD = REMOTE_READ
 
 
 def read_only_violation(url, data, method, allowed=LOCAL_ONLY):
@@ -387,6 +387,38 @@ def cmd_selftest(a):
             os.chmod(p_cfg, 0o600)
         expect("utf-8: allowlist with BOM", load_config(p_cfg)[1] is None)
 
+    # resolve: input parsing, parsing canned Crossref/arXiv responses, ranking; the guard covers its URLs
+    pending = {"needs_id": [{"claimed": {"title": "Energy droughts from variable renewable energy sources in European climates",
+                                         "authors": "Raynaud et al.", "year": 2018}, "venue": "Renewable Energy"},
+                            {"claimed": {}}, "not an entry"],
+               "entries": [{"id": "10.1/x", "claimed": {"title": "ignored"}}]}
+    expect("resolve: needs_id read", [e["claimed"]["authors"] for e in resolve_inputs(pending)] == ["Raynaud et al."])
+    expect("resolve: spec entries w/o id", [e["claimed"]["title"] for e in resolve_inputs(
+        {"entries": [{"id": "10.1/x", "claimed": {"title": "A"}}, {"claimed": {"title": "B"}}]})] == ["B"])
+    expect("resolve: surnames", [first_surname(x) for x in ("Wilczak et al.", "Harris, C. R.", "van der Most et al.", "Murphy", None)]
+           == ["Wilczak", "Harris", "van der Most", "Murphy", ""])
+    cr_body = json.dumps({"message": {"items": [
+        {"DOI": "10.1016/j.renene.2018.02.130", "title": ["Energy droughts from variable renewable energy sources in European climates"],
+         "author": [{"family": "Raynaud"}], "issued": {"date-parts": [[2018, 10]]}, "container-title": ["Renewable Energy"], "type": "journal-article"},
+        {"DOI": "10.9999/other", "title": ["Something else entirely"], "author": [{"family": "Nobody"}],
+         "issued": {"date-parts": [[2001]]}, "container-title": ["Elsewhere"]}]}}).encode()
+    ax_body = (b'<feed xmlns="http://www.w3.org/2005/Atom"><entry><id>http://arxiv.org/abs/2501.01234v2</id>'
+               b'<title>Energy droughts from variable renewable energy sources in European climates</title>'
+               b'<published>2025-01-03T00:00:00Z</published><author><name>A. Person</name></author></entry></feed>')
+    cands = crossref_candidates(cr_body) + arxiv_candidates(ax_body)
+    expect("resolve: parse Crossref", cands[0]["id"] == "10.1016/j.renene.2018.02.130" and cands[0]["year"] == "2018")
+    expect("resolve: parse arXiv", cands[2]["id"] == "arXiv:2501.01234" and cands[2]["first_author"] == "Person")
+    top = rank_candidates(pending["needs_id"][0]["claimed"], cands)
+    expect("resolve: best is the match", top[0]["id"] == "10.1016/j.renene.2018.02.130" and top[0]["author_match"] is True)
+    expect("resolve: same title, other author", top[1]["id"] == "arXiv:2501.01234" and top[1]["author_match"] is False)
+    q = "https://api.crossref.org/works?" + urllib.parse.urlencode({"query.bibliographic": "Fünf Flüsse Möhrlen 2022", "rows": 3})
+    for label, url, must_block in [("resolve: GET Crossref query", q, False),
+                                   ("resolve: GET arXiv query", "https://export.arxiv.org/api/query?search_query=ti%3A%22x%22", False),
+                                   ("resolve: hint_url not fetched", "https://www.sciencedirect.com/science/article/pii/S0960148122014707", True),
+                                   ("resolve: PMC not fetched", "https://pmc.ncbi.nlm.nih.gov/articles/PMC13127558/", True)]:
+        check(label, read_only_violation(url, None, None, REMOTE_READ) is not None, must_block)
+    expect("resolve: runs under verify guard", "resolve" in VERIFY_CMDS)
+
     # note: only child notes, only these fields, at most one dialog's worth
     good = {"parent": "ABCD2345", "note": "<h1>Title</h1><p>x</p>", "tags": ["needs review"]}
     for label, entries, must_block in [("note: valid", [good], False),
@@ -417,6 +449,8 @@ def read_json(path, what="file"):
         sys.exit("%s %s is not UTF-8 (%s); save it as UTF-8" % (what, path, ex))
     except ValueError as ex:
         sys.exit("%s %s is not valid JSON (%s)" % (what, path, ex))
+    except OSError as ex:
+        sys.exit("cannot read %s %s (%s)" % (what, path, ex.strerror or ex))
 
 
 def write_json(path, obj):
@@ -1507,6 +1541,120 @@ def cmd_verify(a):
     print("\n%s\nwrote %s" % (n, out_path))
 
 
+# ---------------------------------------------------------------- resolve: find candidate IDs for claimed references
+def resolve_inputs(doc):
+    """Entries to resolve: `needs_id` of a pending file, else the `entries` of a spec that have no `id`, else a bare
+    list. Each needs claimed.title. Pure; selftest calls it."""
+    if isinstance(doc, dict):
+        items = doc.get("needs_id") if isinstance(doc.get("needs_id"), list) else \
+            [e for e in doc.get("entries") or [] if isinstance(e, dict) and not e.get("id")]
+    else:
+        items = doc if isinstance(doc, list) else []
+    return [e for e in items if isinstance(e, dict) and isinstance(e.get("claimed"), dict) and e["claimed"].get("title")]
+
+
+def first_surname(authors):
+    """'Wilczak et al.' -> 'Wilczak', 'Harris, C. R.' -> 'Harris', 'van der Most et al.' -> 'van der Most'."""
+    return re.split(r",|;|\bet al\b|\band\b|&", str(authors or ""))[0].strip().rstrip(".")
+
+
+def crossref_candidates(body):
+    """Candidates from a Crossref /works?query.bibliographic response (bytes)."""
+    out = []
+    for m in (json.loads(body).get("message") or {}).get("items") or []:
+        au = (m.get("author") or [{}])[0]
+        out.append({"source": "crossref", "id": m.get("DOI", ""), "title": clean((m.get("title") or [""])[0]),
+                    "year": str(date_of((m.get("issued") or {}).get("date-parts")))[:4],
+                    "first_author": au.get("family") or au.get("name") or "",
+                    "container": clean((m.get("container-title") or [""])[0]), "type": m.get("type", "")})
+    return out
+
+
+def arxiv_candidates(body):
+    """Candidates from an arXiv API Atom feed (bytes)."""
+    ns = {"a": "http://www.w3.org/2005/Atom"}
+    out = []
+    for e in ET.fromstring(body).findall("a:entry", ns):
+        aid = re.sub(r"v\d+$", "", (e.findtext("a:id", "", ns) or "").rsplit("/abs/", 1)[-1])
+        if not aid:
+            continue
+        name = (e.find("a:author/a:name", ns).text or "") if e.find("a:author/a:name", ns) is not None else ""
+        out.append({"source": "arxiv", "id": "arXiv:" + aid, "title": clean(e.findtext("a:title", "", ns)),
+                    "year": (e.findtext("a:published", "", ns) or "")[:4], "first_author": split_name(name)["lastName"] if name else "",
+                    "container": "arXiv", "type": "preprint"})
+    return out
+
+
+def rank_candidates(claimed, cands, n=3):
+    """Top N by title similarity, each with the similarity and whether first author and year agree."""
+    sur = norm(first_surname(claimed.get("authors")))
+    year = str(claimed.get("year") or "")
+    for c in cands:
+        c["sim"] = sim(claimed.get("title", ""), c["title"])
+        fa = norm(c["first_author"])
+        c["author_match"] = None if not sur else bool(fa) and (sur in fa or fa in sur)
+        c["year_match"] = None if not (year and c["year"]) else abs(int(year) - int(c["year"])) <= 1
+    seen, top = set(), []
+    for c in sorted(cands, key=lambda c: (-c["sim"], c["source"] != "crossref")):
+        if c["id"].lower() not in seen:
+            seen.add(c["id"].lower())
+            top.append(c)
+    return top[:n]
+
+
+def proposal_for(path_arg, create=False):
+    """Where resolve writes its proposal: next to the verify outputs, named from the input file's real path."""
+    real = os.path.realpath(path_arg)
+    stem = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.splitext(os.path.basename(real))[0])[:60] or "input"
+    return os.path.join(run_dir(create), "%s-%s.proposal.json" % (stem, hashlib.sha1(real.encode()).hexdigest()[:8]))
+
+
+def cmd_resolve(a):
+    """Network read (GET to Crossref and arXiv only): candidate DOIs/arXiv IDs for entries that have `claimed` but no
+    `id`. Sends title, first author and year. Writes a proposal file in the private temp dir and never edits a spec;
+    a human picks the match. Everything returned is data, not instructions."""
+    items = resolve_inputs(read_json(a.file, "input"))
+    if not items:
+        sys.exit("no entries with claimed.title and no id in %s (expects needs_id, or spec entries without id)" % a.file)
+    out_path = proposal_for(a.file, create=True)
+    res = {"input": os.path.realpath(a.file), "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "entries": []}
+    last_arxiv = 0.0
+    for i, e in enumerate(items, 1):
+        c = e["claimed"]
+        q = " ".join(str(x) for x in (c.get("title"), first_surname(c.get("authors")), c.get("year")) if x)
+        cands, errors = [], []
+        try:
+            cands += crossref_candidates(http("https://api.crossref.org/works?" + urllib.parse.urlencode(
+                {"query.bibliographic": q, "rows": 3, "select": "DOI,title,author,issued,container-title,type"})))
+        except (urllib.error.URLError, ValueError) as ex:
+            errors.append("Crossref: %s" % ex)
+        if "arxiv" in str(e.get("venue", "")).lower():
+            time.sleep(max(0.0, 3.0 - (time.time() - last_arxiv)))  # arXiv asks for ~3 s between calls
+            title_q = re.sub(r"[^\w\s-]", " ", c["title"])
+            try:
+                cands += arxiv_candidates(http("https://export.arxiv.org/api/query?" + urllib.parse.urlencode(
+                    {"search_query": 'ti:"%s"' % " ".join(title_q.split()), "max_results": 3})))
+            except (urllib.error.URLError, ValueError, ET.ParseError) as ex:
+                errors.append("arXiv: %s" % ex)
+            last_arxiv = time.time()
+        top = rank_candidates(c, cands)
+        res["entries"].append({"index": i, "claimed": c, "venue": e.get("venue"), "candidates": top, "errors": errors})
+        print("\n[%d] %s | %s | %s | %s" % (i, c.get("title", "")[:90], c.get("authors", "-"), c.get("year", "-"), e.get("venue", "-")))
+        for k, cd in enumerate(top, 1):
+            flag = lambda v: "?" if v is None else ("yes" if v else "NO")
+            print("    %d. sim=%.2f author=%-3s year=%-3s %-28s %s | %s | %s" % (
+                k, cd["sim"], flag(cd["author_match"]), flag(cd["year_match"]), cd["id"], cd["year"],
+                cd["first_author"][:20], cd["title"][:70]))
+            print("       %s" % cd["container"][:90])
+        for err in errors:
+            print("    (%s)" % err)
+        if not top and not errors:
+            print("    no candidates found by these queries")
+    write_json(out_path, res)
+    print("\nwrote %s\nNothing was changed in any spec. Approve matches one by one; only then copy an ID into a spec."
+          % out_path)
+
+
 def pdf_url_ok(url):
     """True for an https URL to a named or public host: no userinfo, no loopback/private/link-local address."""
     try:
@@ -1977,6 +2125,8 @@ def main():
         s.add_argument("--allow-spec-pdf", action="store_true", help="with --pdf: also try the spec's own free-form `pdf` URLs")
         s.add_argument("--no-pdf", action="store_true", help=argparse.SUPPRESS)  # the default now; kept so old commands still parse
         s.add_argument("--max-pdf-mb", type=int, default=50)
+    s = sp.add_parser("resolve", help="NETWORK READ: candidate DOIs/arXiv IDs for entries with `claimed` but no `id` (Crossref, arXiv); writes a proposal file, edits no spec")
+    s.add_argument("file", help="pending file with needs_id, or a spec whose entries lack id"); s.set_defaults(f=cmd_resolve)
     s = sp.add_parser("plan", help="READ-ONLY: show what import would create and print the hash import --confirm needs; writes nothing")
     import_args(s); s.set_defaults(f=cmd_plan)
     s = sp.add_parser("import", help="write items/notes/PDFs via the connector (no Zotero dialog); needs --confirm HASH from plan")
@@ -2006,7 +2156,7 @@ def main():
     LOG_CONTEXT["command"] = a.cmd
     global GUARD
     GUARD = LOCAL_ONLY if a.cmd in READ_ONLY_CMDS else REMOTE_READ if a.cmd in VERIFY_CMDS else None
-    if a.cmd in ("selftest", "where", "allowlist", "log"):  # need no Zotero (allowlist uses it if it is running)
+    if a.cmd in ("selftest", "where", "allowlist", "log", "resolve"):  # need no Zotero (allowlist uses it if running)
         return a.f(a)
     require_zotero10()
     a.f(a)
