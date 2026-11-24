@@ -523,6 +523,20 @@ def cmd_selftest(a):
     top = rank_candidates(pending["needs_id"][0]["claimed"], cands)
     expect("resolve: best is the match", top[0]["id"] == "10.1016/j.renene.2018.02.130" and top[0]["author_match"] is True)
     expect("resolve: same title, other author", top[1]["id"] == "arXiv:2501.01234" and top[1]["author_match"] is False)
+    # author names compared with accents folded (NFKD plus a mapping for ø, ł, ß, ...); titles unchanged
+    t_pm = "Measuring a paradox: Zero-negative electricity prices"
+    for label, claimed_a, resolved_a, must_match in [("authors: Daví = Davi", "Daví-Arderius et al.", "Davi-Arderius", True),
+                                                     ("authors: Gonçalves = Goncalves", "Gonçalves, Pinson, Bessa", "Goncalves", True),
+                                                     ("authors: Sørensen = Sorensen", "Sørensen et al.", "Sorensen", True),
+                                                     ("authors: Strauß = Strauss", "Strauß et al.", "Strauss", True),
+                                                     ("authors: Łaś = Las", "Łaś, A.", "Las", True),
+                                                     ("authors: other person", "Daví-Arderius et al.", "Brijs", False)]:
+        ok_v = title_matches({"title": t_pm, "authors": claimed_a}, {"title": t_pm, "creators": [{"lastName": resolved_a}]})[0]
+        ok_r = rank_candidates({"title": t_pm, "authors": claimed_a}, [{"source": "crossref", "id": "10.1/x", "title": t_pm,
+                                "year": "", "first_author": resolved_a}])[0]["author_match"]
+        expect(label + " (verify, resolve)", ok_v == must_match and ok_r == must_match)
+    expect("authors: fold keeps ASCII", fold_ascii("van der Most") == "van der Most" and author_norm("Ø") == "o")
+    expect("titles: norm() unchanged", norm("Daví") == "dav" and norm("Gonçalves") == "gonalves")
     q = "https://api.crossref.org/works?" + urllib.parse.urlencode({"query.bibliographic": "Fünf Flüsse Möhrlen 2022", "rows": 3})
     for label, url, must_block in [("resolve: GET Crossref query", q, False),
                                    ("resolve: GET arXiv query", "https://export.arxiv.org/api/query?search_query=ti%3A%22x%22", False),
@@ -800,6 +814,24 @@ def norm(s):
     return re.sub(r"[^a-z0-9 ]", "", html.unescape(s or "").lower()).strip()
 
 
+# letters that Unicode decomposition (NFKD) does not reduce to ASCII; everything else loses its accents via NFKD
+_ASCII_EXTRA = str.maketrans({"ß": "ss", "æ": "ae", "Æ": "Ae", "œ": "oe", "Œ": "Oe", "ø": "o", "Ø": "O", "đ": "d",
+                              "Đ": "D", "ł": "l", "Ł": "L", "þ": "th", "Þ": "Th", "ð": "d", "Ð": "D", "ı": "i", "ħ": "h",
+                              "Ħ": "H", "ŧ": "t", "Ŧ": "T"})
+
+
+def fold_ascii(s):
+    """S with accents removed and the letters above spelled out: 'Daví' -> 'Davi', 'Sørensen' -> 'Sorensen'. Pure."""
+    t = unicodedata.normalize("NFKD", html.unescape(str(s or "")).translate(_ASCII_EXTRA))
+    return "".join(ch for ch in t if not unicodedata.combining(ch))
+
+
+def author_norm(s):
+    """norm() for author names, after fold_ascii(), so a claimed 'Gonçalves' matches a resolved 'Goncalves'. Titles
+    keep using norm()/sim() unchanged."""
+    return norm(fold_ascii(s))
+
+
 def strip_tags(s):
     return html.unescape(re.sub(r"<[^>]+>", " ", s or "")).replace("\n", " ").strip()
 
@@ -914,8 +946,8 @@ def title_matches(claimed, item):
     ok = s is None or s >= SIM_OK
     a = c.get("authors") or ""
     if a and not a.lower().startswith("authors unknown"):
-        first = norm(a.split(",")[0])
-        lasts = [norm(x.get("lastName", "")) for x in item.get("creators", [])]
+        first = author_norm(a.split(",")[0])
+        lasts = [author_norm(x.get("lastName", "")) for x in item.get("creators", [])]
         if first and not any(first in l or l in first for l in lasts if l):
             ok = False
             notes.append("first author %r not among resolved authors" % a.split(",")[0])
@@ -1146,13 +1178,11 @@ def cmd_export(a):
 # an export_dirs entry of the user's config file. Only files Zotero stores itself (storage/<KEY>/) are copied, so a
 # linked-file attachment pointing elsewhere on the disk cannot pull an unrelated file into the bundle.
 MANIFEST_COLUMNS = ["key", "DOI", "title", "authors", "year", "subcollection", "tags", "filename", "has_pdf"]
-_ASCII_EXTRA = str.maketrans({"ß": "ss", "æ": "ae", "Æ": "Ae", "œ": "oe", "Œ": "Oe", "ø": "o", "Ø": "O", "đ": "d",
-                              "Đ": "D", "ł": "l", "Ł": "L", "þ": "th", "Þ": "Th", "ð": "d", "ı": "i"})
 
 
 def ascii_part(text, sep=""):
     """TEXT reduced to ASCII letters and digits, other runs replaced by SEP: 'Terrén-Serrano' -> 'TerrenSerrano'. Pure."""
-    t = unicodedata.normalize("NFKD", str(text or "").translate(_ASCII_EXTRA)).encode("ascii", "ignore").decode("ascii")
+    t = fold_ascii(text).encode("ascii", "ignore").decode("ascii")
     return re.sub(r"[^A-Za-z0-9]+", sep, t).strip(sep)
 
 
@@ -2029,11 +2059,11 @@ def arxiv_candidates(body):
 
 def rank_candidates(claimed, cands, n=3):
     """Top N by title similarity, each with the similarity and whether first author and year agree."""
-    sur = norm(first_surname(claimed.get("authors")))
+    sur = author_norm(first_surname(claimed.get("authors")))
     year = str(claimed.get("year") or "")
     for c in cands:
         c["sim"] = sim(claimed.get("title", ""), c["title"])
-        fa = norm(c["first_author"])
+        fa = author_norm(c["first_author"])
         c["author_match"] = None if not sur else bool(fa) and (sur in fa or fa in sur)
         c["year_match"] = None if not (year and c["year"]) else abs(int(year) - int(c["year"])) <= 1
     seen, top = set(), []
