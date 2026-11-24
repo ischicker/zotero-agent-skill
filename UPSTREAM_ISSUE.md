@@ -32,9 +32,10 @@ Each change is one commit on branch `hardening` in my fork (<https://github.com/
 | --- | --- | --- |
 | A | `b0f784b` | `ZOTERO_HOST` must be loopback `http://` with a port (no userinfo, no path); `localhost` becomes `127.0.0.1`. The read guard trusts everything under `HOST`, so a remote value widened it. |
 | B | `f4a2550`, BOM part of `d0188ad` | Every file is read and written as UTF-8, with a BOM tolerated on input. `json.load(open(spec))` used the Windows code page and mangled umlauts and Nordic letters on their way into Zotero. stdout uses `errors="replace"`. |
-
 | B2 | `e792675` | `organize` replaced an item's whole tag list with the spec's tags. On an existing paper dragged into the collection, that deleted tags from other projects. It now adds the spec's tags and keeps all others; only `prio:`/`status:`/`decision:` are single-valued (only relevant with the screening convention, so that part can be dropped). |
 | B3 | `e15a6d9` | Wait 10 min instead of 3 for the approval dialog, and ring the terminal bell. Live, Zotero's dialog often opened behind other windows, and a missed one leaves an import half-done. |
+| B4 | `1f41726` | `verify` crashed with a traceback when arXiv answered a burst with HTTP 429 and a read then timed out (`TimeoutError` is not a `URLError`). arXiv calls are now 3 s apart, every `OSError` is caught per entry, and transient failures get status `error` (re-run) instead of `notfound`. |
+| B5 | `746fa4c` | Author comparison in `verify` and `resolve` folds accents (NFKD plus a mapping for ø, ł, ß, đ, ...). `norm()` deleted non-ASCII letters, so a claimed "Daví-Arderius" or "Gonçalves" did not match Crossref's "Davi-Arderius"/"Goncalves" and correct papers came out as `MISMATCH`. Titles are compared as before. |
 
 `d0188ad` also contains an unrelated one-line output change for `plan`, so PR B needs a split cherry-pick. I kept the history as it is.
 
@@ -51,6 +52,8 @@ Each change is one commit on branch `hardening` in my fork (<https://github.com/
 | I | `1d34ae9` | `resolve`: candidate DOIs/arXiv IDs for entries with `claimed` but no `id`, from Crossref `query.bibliographic` and arXiv. It runs under verify's guard and writes a proposal file without editing a spec. |
 | K | `a8e38ec` | Read-only `export`: a collection with its subcollections as CSV, or as BibTeX through Zotero's own translator (`format=bibtex`). The `annote` fields (child notes) are dropped unless `--keep-notes`. `--out` only creates new files. |
 | L | `245eeb0` | `references/screening.md`: a convention for screening one paper's literature (blocks, `prio:`/`status:`/`decision:` tags). Optional, and maybe too specific for upstream. |
+| M | `01fc1be` | `file LIB KEY... --coll COLL`: add an existing paper (filed under another project, or unfiled) to an allowlisted collection. Membership only; the one narrow exception to the allowlist for items outside it. |
+| N | `45760dc` | `bundle`: copy a collection's PDFs plus `manifest.csv` into a new folder inside an `export_dirs` entry of the allowlist file, e.g. for a notebook tool. Zotero is only read; only files from Zotero's own storage are copied, never linked files. |
 | J | `080447e`, `dcd9fbc` plus later doc edits | Docs: SKILL.md, read-only-safety.md and gotchas.md match the code. The README gets a "Based on" section (only relevant to the fork). |
 
 ## Open points I could not settle
