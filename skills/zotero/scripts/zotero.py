@@ -30,7 +30,7 @@ Design rule: the model never types bibliographic metadata. It supplies identifie
 (DOI / arXiv ID); metadata comes from Crossref / arXiv and is compared with what the
 source document claimed before anything is written.
 """
-import argparse, difflib, hashlib, html, ipaddress, json, mimetypes, os, re, stat, sys, tempfile, time, urllib.error, urllib.parse, urllib.request
+import argparse, difflib, hashlib, html, ipaddress, json, mimetypes, os, re, shutil, stat, sys, tempfile, time, unicodedata, urllib.error, urllib.parse, urllib.request
 import xml.etree.ElementTree as ET
 
 DEFAULT_HOST = "http://127.0.0.1:23119"
@@ -81,7 +81,7 @@ SIM_OK = 0.85
 GUARD = None
 LOCAL_ONLY = (HOST + "/",)
 REMOTE_READ = LOCAL_ONLY + ("https://api.crossref.org/", "https://export.arxiv.org/", "https://api.openalex.org/")
-READ_ONLY_CMDS = {"status", "libs", "colls", "ls", "find", "notes", "path", "plan", "where", "selftest", "allowlist", "log", "export"}  # GUARD = LOCAL_ONLY
+READ_ONLY_CMDS = {"status", "libs", "colls", "ls", "find", "notes", "path", "plan", "where", "selftest", "allowlist", "log", "export", "bundle"}  # GUARD = LOCAL_ONLY
 VERIFY_CMDS = {"verify", "resolve"}                                                       # GUARD = REMOTE_READ
 
 
@@ -434,6 +434,58 @@ def cmd_selftest(a):
     check("export: GET bibtex local", read_only_violation(h + "/api/users/0/items?format=bibtex&itemKey=A,B", None, None) is not None, False)
     expect("export: is read-only", "export" in READ_ONLY_CMDS)
     expect("approval: waits 10 min", APPROVAL_WAIT == 600)
+
+    # bundle: ASCII file names, a new/empty folder inside export_dirs only, only files from Zotero's own storage
+    expect("bundle: ascii names", [ascii_part(x) for x in ("Terrén-Serrano", "van der Most", "Strauß", "Sørensen", "Łukasz")]
+           == ["TerrenSerrano", "vanderMost", "Strauss", "Sorensen", "Lukasz"])
+    expect("bundle: folder names", ascii_part("Block 1", "_") == "Block_1" and ascii_part("Abgrenzung (ä)", "_") == "Abgrenzung_a")
+    expect("bundle: file name", bundle_filename("K1AAAAAA", items_x["K1"]) == "K1AAAAAA__Bjerregard2024.pdf")
+    expect("bundle: 2nd PDF, no year", bundle_filename("K2AAAAAA", items_x["K2"], 2) == "K2AAAAAA__IEAWind_2.pdf")
+    expect("bundle: no author", bundle_filename("K3AAAAAA", {"date": "1993"}) == "K3AAAAAA__Anon1993.pdf")
+    for label, key in [("bundle: key with path", "../../x"), ("bundle: key lower case", "abcd2345")]:
+        try:
+            bundle_filename(key, {}); check(label, False, True)
+        except ValueError:
+            check(label, True, True)
+    check("allowlist: export_dirs", parse_config('{"export_dirs": ["%s"]}' % os.path.abspath(os.sep).replace("\\", "\\\\"))[1] is not None, False)
+    check("allowlist: export_dirs relative", parse_config('{"export_dirs": ["bundles"]}')[1] is not None, True)
+    check("allowlist: export_dirs not list", parse_config('{"export_dirs": "C:/x"}')[1] is not None, True)
+    with tempfile.TemporaryDirectory() as td:
+        exp, other = os.path.join(td, "bundles"), os.path.join(td, "other")
+        os.makedirs(os.path.join(exp, "empty")); os.makedirs(os.path.join(exp, "full")); os.makedirs(other)
+        open(os.path.join(exp, "full", "x.pdf"), "wb").close()
+        open(os.path.join(exp, "afile"), "wb").close()
+        dirs = [exp]
+        for label, path, ds, must_block in [("bundle: new dir inside", os.path.join(exp, "new"), dirs, False),
+                                            ("bundle: nested new dir", os.path.join(exp, "a", "b"), dirs, False),
+                                            ("bundle: empty dir inside", os.path.join(exp, "empty"), dirs, False),
+                                            ("bundle: non-empty dir", os.path.join(exp, "full"), dirs, True),
+                                            ("bundle: existing file", os.path.join(exp, "afile"), dirs, True),
+                                            ("bundle: export dir itself", exp, dirs, True),
+                                            ("bundle: outside", os.path.join(other, "new"), dirs, True),
+                                            ("bundle: .. out of dir", os.path.join(exp, "..", "other", "new"), dirs, True),
+                                            ("bundle: prefix lookalike", os.path.join(td, "bundles-evil", "x"), dirs, True),
+                                            ("bundle: no export_dirs", os.path.join(exp, "new"), [], True)]:
+            check(label, bundle_dir_problem(path, ds) is not None, must_block)
+        try:
+            os.symlink(other, os.path.join(exp, "link"), target_is_directory=True)
+            check("bundle: symlink out of dir", bundle_dir_problem(os.path.join(exp, "link"), dirs) is not None, True)
+        except (OSError, NotImplementedError):
+            print("%-30s skipped (cannot create symlinks here)" % "bundle: symlink out of dir")
+        st = os.path.join(td, "Zotero", "storage", "ABCD2345")
+        os.makedirs(st)
+        open(os.path.join(st, "paper.pdf"), "wb").close()
+        check("bundle: file in storage", storage_file_problem(os.path.join(st, "paper.pdf"), "ABCD2345") is not None, False)
+        check("bundle: other att key", storage_file_problem(os.path.join(st, "paper.pdf"), "ZZZZ9999") is not None, True)
+        check("bundle: linked file elsewhere", storage_file_problem(os.path.join(other, "id_rsa"), "ABCD2345") is not None, True)
+        check("bundle: missing in storage", storage_file_problem(os.path.join(st, "gone.pdf"), "ABCD2345") is not None, True)
+        check("bundle: .. out of storage", storage_file_problem(os.path.join(st, "..", "..", "x.pdf"), "ABCD2345") is not None, True)
+    mrows = manifest_rows(dict(items_x), dict(names_x, ROOT="JoS"), {"ROOT", "B1"}, "ROOT", {"K1": ["K1__Bjerregard2024.pdf"]})
+    expect("bundle: manifest columns", len(MANIFEST_COLUMNS) == 9 and all(len(r) == 9 for r in mrows))
+    expect("bundle: manifest has_pdf", [(r[0], r[8], r[7]) for r in mrows] == [("K1", "true", "K1__Bjerregard2024.pdf"), ("K2", "false", "")])
+    expect("bundle: subcoll within tree", mrows[0][5] == "Block 1" and mrows[0][6] == "decision:offen; prio:muss")
+    expect("bundle: is read-only", "bundle" in READ_ONLY_CMDS)
+    check("bundle: GET file url local", read_only_violation(h + "/api/users/0/items/ABCD2345/file/view/url", None, None) is not None, False)
 
     # organize keeps tags it does not manage; single-value screening prefixes are replaced, not duplicated
     cur = [{"tag": "D1.3-Ch8", "type": 0}, {"tag": "Physics - Atmospheric and Oceanic Physics", "type": 1},
@@ -1089,6 +1141,138 @@ def cmd_export(a):
         print("-- %d items from %d collection(s)" % (len(items), len(keys)), file=sys.stderr)
 
 
+# ---------------------------------------------------------------- bundle: copy a collection's PDFs to a local folder
+# Zotero is only read (GET to loopback, like export). The only writes are new files in a new or empty folder inside
+# an export_dirs entry of the user's config file. Only files Zotero stores itself (storage/<KEY>/) are copied, so a
+# linked-file attachment pointing elsewhere on the disk cannot pull an unrelated file into the bundle.
+MANIFEST_COLUMNS = ["key", "DOI", "title", "authors", "year", "subcollection", "tags", "filename", "has_pdf"]
+_ASCII_EXTRA = str.maketrans({"ß": "ss", "æ": "ae", "Æ": "Ae", "œ": "oe", "Œ": "Oe", "ø": "o", "Ø": "O", "đ": "d",
+                              "Đ": "D", "ł": "l", "Ł": "L", "þ": "th", "Þ": "Th", "ð": "d", "ı": "i"})
+
+
+def ascii_part(text, sep=""):
+    """TEXT reduced to ASCII letters and digits, other runs replaced by SEP: 'Terrén-Serrano' -> 'TerrenSerrano'. Pure."""
+    t = unicodedata.normalize("NFKD", str(text or "").translate(_ASCII_EXTRA)).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^A-Za-z0-9]+", sep, t).strip(sep)
+
+
+def bundle_filename(key, data, n=1):
+    """<KEY>__<FirstAuthorLastName><Year>.pdf, ASCII only; _2, _3 ... for further PDFs of the same item. Pure."""
+    if not re.fullmatch(r"[A-Z0-9]{8}", key or ""):
+        raise ValueError("not a Zotero item key: %r" % key)
+    people = [c for c in data.get("creators", []) if c.get("creatorType") == "author"] or data.get("creators", [])
+    who = ascii_part(people[0].get("lastName") or people[0].get("name")) if people else ""
+    year = (re.search(r"\d{4}", data.get("date") or "") or [""])[0]
+    return "%s__%s%s%s.pdf" % (key, who or "Anon", year, "_%d" % n if n > 1 else "")
+
+
+def bundle_dir_problem(path, dirs):
+    """None if PATH (symlinks resolved) is strictly inside an export_dirs entry and is new or an empty directory;
+    else why bundle refuses it. Fail closed: no export_dirs, a symlink, a file or a non-empty folder all refuse."""
+    if not dirs:
+        return "no export_dirs in %s; only the user adds them" % config_path()
+    real = os.path.realpath(os.path.expanduser(path))
+    if not strictly_inside(real, dirs):
+        return "%s (resolved: %s) is not inside any export_dirs entry of %s" % (path, real, config_path())
+    if os.path.islink(os.path.expanduser(path)):
+        return "%s is a symlink" % path
+    if os.path.lexists(real):
+        if not os.path.isdir(real):
+            return "%s exists and is not a directory" % real
+        if os.listdir(real):
+            return "%s is not empty; bundle never overwrites, choose a new folder" % real
+    return None
+
+
+def storage_file_problem(path, att_key):
+    """None if PATH (resolved) is a regular file Zotero stores itself, i.e. .../storage/<ATT_KEY>/<name>; else why not."""
+    real = os.path.realpath(path)
+    parent = os.path.dirname(real)
+    if os.path.basename(parent) != att_key or os.path.basename(os.path.dirname(parent)).lower() != "storage":
+        return "not in Zotero's storage folder (%s)" % real
+    if not os.path.isfile(real):
+        return "file missing on disk (%s)" % real
+    return None
+
+
+def manifest_rows(items, names, tree, root, files):
+    """Manifest rows (MANIFEST_COLUMNS) in export order. FILES: {item key: [relative file names]}. Pure."""
+    rows = []
+    for r in export_rows(items, names):
+        k = r[0]
+        subs = sorted((names.get(c, c) for c in items[k].get("collections", []) if c in tree and c != root), key=str.lower)
+        got = files.get(k) or []
+        rows.append([k, r[1], r[2], r[3], r[4], "; ".join(subs), r[5], "; ".join(got), "true" if got else "false"])
+    return rows
+
+
+def cmd_bundle(a):
+    """Read-only for Zotero: copy the PDFs of collection COLL (and its subcollections) into a new folder --out inside
+    an export_dirs entry, plus manifest.csv. GET requests only; nothing is sent anywhere but 127.0.0.1."""
+    c, err = load_config()
+    if err:
+        sys.exit("bundle refused: %s.\nOnly the user adds export_dirs to that file." % err)
+    why = bundle_dir_problem(a.out, c["export_dirs"])
+    if why:
+        sys.exit("bundle refused: " + why)
+    lp = lib_path(a.lib)
+    keys, names = collection_tree(lp, a.coll, True)
+    root, tree, items = keys[0], set(keys), tree_items(lp, keys)
+    plan, missing = {}, {}  # plan: {item key: [source paths]}; missing: {item key: reason}
+    for k, d in items.items():
+        kids = zget(lp + "/items/%s/children" % k, itemType="attachment", include="data")[0]
+        pdfs = [x for x in kids if x["data"].get("contentType") == "application/pdf"]
+        reasons = []
+        for x in pdfs:
+            if x["data"].get("linkMode") not in ("imported_file", "imported_url"):
+                reasons.append("linked file (%s), not copied" % x["data"].get("linkMode")); continue
+            try:
+                url = http(HOST + "/api" + lp + "/items/%s/file/view/url" % x["key"], headers={"Zotero-API-Version": "3"}).decode().strip()
+            except urllib.error.HTTPError as ex:
+                reasons.append("no file (HTTP %d)" % ex.code); continue
+            src = urllib.request.url2pathname(urllib.parse.urlparse(url).path)
+            bad = storage_file_problem(src, x["key"])
+            if not bad:
+                with open(src, "rb") as f:
+                    bad = None if f.read(5) == b"%PDF-" else "not a PDF file (%s)" % src
+            if bad:
+                reasons.append(bad); continue
+            plan.setdefault(k, []).append(os.path.realpath(src))
+        if k not in plan:
+            missing[k] = "; ".join(reasons) or "no PDF attachment"
+    real = os.path.realpath(os.path.expanduser(a.out))
+    os.makedirs(real, exist_ok=True)
+    if bundle_dir_problem(a.out, c["export_dirs"]):  # re-check after creating: nothing may have swapped the folder
+        sys.exit("bundle refused: %s changed while it was created" % a.out)
+    files, n_copied, size = {}, 0, 0
+    for k, srcs in plan.items():
+        d = items[k]
+        folders = [""]
+        if a.by_subcollection:
+            subs = [names.get(x, x) for x in d.get("collections", []) if x in tree and x != root]
+            folders = sorted(set(ascii_part(s, "_") or "_" for s in subs)) or [""]
+        for folder in folders:
+            if folder:
+                os.makedirs(os.path.join(real, folder), exist_ok=True)
+            for n, src in enumerate(srcs, 1):
+                name = bundle_filename(k, d, n)
+                with open(src, "rb") as fi, open(os.path.join(real, folder, name), "xb") as fo:
+                    shutil.copyfileobj(fi, fo)
+                files.setdefault(k, []).append(folder + "/" + name if folder else name)
+                n_copied += 1
+                size += os.path.getsize(src)
+    import csv
+    with open(os.path.join(real, "manifest.csv"), "x", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f, lineterminator="\n")
+        w.writerow(MANIFEST_COLUMNS)
+        w.writerows(manifest_rows(items, names, tree, root, files))
+    print("bundle: %d items from %d collection(s); %d with a PDF, %d without; copied %d file(s), %.1f MB -> %s"
+          % (len(items), len(keys), len(plan), len(missing), n_copied, size / 1e6, real))
+    for k in sorted(missing, key=lambda k: export_rows({k: items[k]}, names)[0][3].lower()):
+        print("  no PDF  %s  %-30s %s" % (k, bundle_filename(k, items[k])[10:-4], missing[k]))
+    print("manifest: %s" % os.path.join(real, "manifest.csv"))
+
+
 def note_present(html_note, existing_texts, threshold=0.8):
     """True if a (possibly human-edited) top-level note resembling this one already exists."""
     mine = norm(clean(html_note)[:600])
@@ -1127,7 +1311,7 @@ def library_tags(lp):
 # Every write is checked twice: local_write() and connector_scope() compare the target with the allowlist, and
 # http() refuses any non-GET request that no such check covered (write_violation). No file, no writes.
 APP_DIR = "zotero-skill"
-CONFIG_KEYS = {"write_targets", "attach_dirs", "_comment"}
+CONFIG_KEYS = {"write_targets", "attach_dirs", "export_dirs", "_comment"}
 CONFIG_EXAMPLE = json.dumps({"write_targets": [{"library": "My Library", "collection": "Skill-Test", "subcollections": True}],
                              "attach_dirs": [os.path.join(os.path.expanduser("~"), "Documents", "zotero-attach")]})
 AUTHORIZED_LIBS = set()   # library paths ("/users/0") whose write targets local_write() checked in this run
@@ -1169,10 +1353,12 @@ def parse_config(text):
                 or not isinstance(t.get("subcollections", False), bool)):
             return None, ("each write_targets entry needs non-empty strings library and collection, and optionally "
                           "subcollections: true/false; got %s" % json.dumps(t))
-    dirs = c.get("attach_dirs", [])
-    if not isinstance(dirs, list) or not all(isinstance(d, str) and os.path.isabs(os.path.expanduser(d)) for d in dirs):
-        return None, "attach_dirs must be a list of absolute directory paths"
-    c["write_targets"], c["attach_dirs"] = targets, dirs
+    for key in ("attach_dirs", "export_dirs"):
+        dirs = c.get(key, [])
+        if not isinstance(dirs, list) or not all(isinstance(d, str) and os.path.isabs(os.path.expanduser(d)) for d in dirs):
+            return None, "%s must be a list of absolute directory paths" % key
+        c[key] = dirs
+    c["write_targets"] = targets
     return c, None
 
 
@@ -1180,6 +1366,13 @@ def attach_file_problem(path, dirs):
     """None if `path`, with symlinks resolved, is a file strictly inside one of `dirs` (also resolved), else why not.
     Resolving first means neither `..` nor a symlink placed inside an allowed directory can reach outside it."""
     real = os.path.realpath(os.path.expanduser(path))
+    if strictly_inside(real, dirs):
+        return None
+    return "%s (resolved: %s) is not inside any attach_dirs entry of %s" % (path, real, config_path())
+
+
+def strictly_inside(real, dirs):
+    """True if the resolved path REAL lies below (not at) one of DIRS, each resolved too."""
     for d in dirs:
         rd = os.path.realpath(os.path.expanduser(d))
         try:
@@ -1187,8 +1380,8 @@ def attach_file_problem(path, dirs):
         except ValueError:  # different drives
             inside = False
         if inside and os.path.normcase(real) != os.path.normcase(rd):
-            return None
-    return "%s (resolved: %s) is not inside any attach_dirs entry of %s" % (path, real, config_path())
+            return True
+    return False
 
 
 def load_config(path=None):
@@ -1380,6 +1573,11 @@ def cmd_allowlist(a):
     for d in c["attach_dirs"]:
         rd = os.path.realpath(os.path.expanduser(d))
         print("attach dir:   %s%s%s" % (d, "" if rd == d else "  (resolved: %s)" % rd, "" if os.path.isdir(rd) else "  [missing]"))
+    if not c["export_dirs"]:
+        print("export_dirs: none, so `bundle` writes nowhere")
+    for d in c["export_dirs"]:
+        rd = os.path.realpath(os.path.expanduser(d))
+        print("export dir:   %s%s%s" % (d, "" if rd == d else "  (resolved: %s)" % rd, "" if os.path.isdir(rd) else "  [missing]"))
     try:
         require_zotero10()
     except SystemExit:
@@ -2392,6 +2590,11 @@ def main():
     s.add_argument("--out", help="new .csv/.bib file to write (UTF-8; never overwrites); default stdout")
     s.add_argument("--keep-notes", action="store_true", help="bibtex: keep Zotero's annote fields (child notes); dropped by default")
     s.set_defaults(f=cmd_export)
+    s = sp.add_parser("bundle", help="READ-ONLY for Zotero: copy a collection's PDFs (with subcollections) and a manifest.csv into a new folder inside an export_dirs entry")
+    s.add_argument("lib"); s.add_argument("--coll", required=True)
+    s.add_argument("--out", required=True, metavar="DIR", help="new or empty folder inside an export_dirs entry of the config file")
+    s.add_argument("--by-subcollection", action="store_true", help="one subfolder per subcollection (a paper in two is copied into both)")
+    s.set_defaults(f=cmd_bundle)
     s = sp.add_parser("resolve", help="NETWORK READ: candidate DOIs/arXiv IDs for entries with `claimed` but no `id` (Crossref, arXiv); writes a proposal file, edits no spec")
     s.add_argument("file", help="pending file with needs_id, or a spec whose entries lack id"); s.set_defaults(f=cmd_resolve)
     s = sp.add_parser("plan", help="READ-ONLY: show what import would create and print the hash import --confirm needs; writes nothing")

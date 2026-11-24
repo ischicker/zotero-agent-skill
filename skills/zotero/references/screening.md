@@ -54,3 +54,4 @@ The spec's top-level `tags` (e.g. `["JoS SDG7", "needs review"]`) go on every en
 
 - Table for screening: `export "My Library" "<Paper collection>" --out screening.csv`, then filter the `tags` column, e.g. for `decision:einschliessen`; the `collections` column shows the block.
 - Bibliography: `export "My Library" "<Paper collection>" --format bibtex --out refs.bib`. The child notes (`annote`) are left out unless `--keep-notes`; keep it that way for anything that leaves your machine.
+- Full texts for a notebook tool: `bundle "My Library" --coll "<Paper collection>" --out <export dir>/<new folder> [--by-subcollection]`; `manifest.csv` lists every paper, `has_pdf=false` for those still to fetch. Answers that come back from such a tool are LLM output: add them as child notes marked as such (`note`), and only then move `status:abstract` to `status:volltext` with `organize`.
